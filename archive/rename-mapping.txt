@@ -1,0 +1,42 @@
+# Archive File Rename Mapping
+# Generated: 2026-01-20
+# Format: OLD_NAME → NEW_NAME
+
+## unleashed.py variants (16 files)
+unleashed.py-cbbdd33_2026-01-14_12-03-44 → unleashed-A01.py
+unleashed.py-733ffa3_2026-01-14_12-07-40 → unleashed-A02.py
+unleashed.py-9360aad_2026-01-14_12-09-15 → unleashed-A03.py
+unleashed.py-c95798a_2026-01-14_12-11-20 → unleashed-A04.py
+unleashed.py-03b46b7_2026-01-14_12-34-44 → unleashed-A05.py
+unleashed.py-4289628_2026-01-14_12-37-48 → unleashed-A06.py
+unleashed.py-03dd562_2026-01-14_12-45-08 → unleashed-A07.py
+unleashed.py-50596c0_2026-01-14_13-12-52 → unleashed-A08.py
+unleashed.py-87a99a7_2026-01-14_13-14-08 → unleashed-A09.py
+unleashed.py-94c099d_2026-01-14_13-34-37 → unleashed-A10.py
+unleashed.py-b820167_2026-01-14_13-56-19 → unleashed-A11.py
+unleashed.py-bbe20a4_2026-01-15_09-54-35 → unleashed-A12.py
+unleashed.py-a527fd7_2026-01-16_10-54-55 → unleashed-A13.py
+unleashed.py-e4c8ef4_2026-01-17_01-04-26 → unleashed-A14.py
+unleashed.py-uncommitted_2026-01-18_15-25-00 → unleashed-A15.py
+unleashed.py → unleashed-A16.py
+
+## unleashed-danger.py variants (2 files)
+unleashed-danger.py-a527fd7_2026-01-16_10-54-55 → unleashed-danger-A01.py
+unleashed-danger.py-uncommitted_2026-01-17_18-30-00 → unleashed-danger-A02.py
+
+## unleashed-test.py variants (2 files)
+unleashed-test.py-a527fd7_2026-01-16_10-54-55 → unleashed-test-A01.py
+unleashed-test.py-uncommitted_2026-01-18_15-09-00 → unleashed-test-A02.py
+
+## unleashed-danger-test.py variants (2 files)
+unleashed-danger-test.py-a527fd7_2026-01-16_10-54-55 → unleashed-danger-test-A01.py
+unleashed-danger-test.py-uncommitted_2026-01-17_11-01-00 → unleashed-danger-test-A02.py
+
+## unleashed-guarded.py variants (1 file)
+unleashed-guarded.py-uncommitted_2026-01-18_01-01-00 → unleashed-guarded-A01.py
+
+## sentinel.py variants (1 file)
+sentinel.py-uncommitted_2026-01-18_00-41-00 → sentinel-A01.py
+
+## sentinel-test.py variants (1 file)
+sentinel-test.py-uncommitted_2026-01-17_18-27-00 → sentinel-test-A01.py
