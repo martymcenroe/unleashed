@@ -1,0 +1,23 @@
+[project]
+name = "unleashed"
+version = "0.1.0"
+description = "Permission bypass system for Claude Code"
+authors = [{name = "Marty McEnroe"}]
+readme = "README.md"
+requires-python = "^3.10"
+dependencies = [
+    "pywinpty (>=3.0.2,<4.0.0)",
+    "anthropic (>=0.76.0,<0.77.0)"
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (>=9.0.2,<10.0.0)"
+]
