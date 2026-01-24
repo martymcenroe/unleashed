@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-Unleashed - v00015
-- Fix: Normalize UTF-16 surrogate pairs before PTY write (fixes pywinpty panic on emoji paste)
-- Fix: More specific approval pattern - match "Esc to cancel · Tab" not just "Esc to cancel"
-       This prevents false triggers on Resume Session picker and other UI screens
-- Fix: Chunk PTY writes to avoid winpty buffer panic on large paste
+Unleashed - v00014
+- Fix: Chunk PTY writes to 256 bytes to avoid winpty 512-byte buffer panic on large paste
 - Fix: More conservative console mode - don't set ENABLE_WINDOW_INPUT (may interfere with Ink)
+- Fix: Better handling of console modes for Ink-based TUI
 - Fix: Use ReadConsoleInput API for larger paste buffer (bypass msvcrt limits)
 - Fix: Batch-read stdin to handle large pastes (fixes freeze on paste)
 - Fix: Add Shift+Tab support for mode cycling (plan mode, accept edits)
@@ -24,7 +22,7 @@ import shutil
 import ctypes
 from ctypes import wintypes
 
-VERSION = "00015"
+VERSION = "00014"
 
 # winpty write buffer limit - very small chunks to handle UTF-16 expansion on Windows
 PTY_WRITE_CHUNK_SIZE = 64  # Small to account for UTF-16 surrogate pairs
@@ -79,10 +77,7 @@ class INPUT_RECORD(ctypes.Structure):
     ]
 
 CLAUDE_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\claude.cmd"
-
-# Specific pattern for permission prompts - includes "Tab to add" to distinguish from other screens
-# The middle dot (·) is U+00B7, encoded as \xc2\xb7 in UTF-8
-FOOTER_PATTERN = b'Esc to cancel \xc2\xb7 Tab to add'
+FOOTER_PATTERN = b'Esc to cancel'
 
 # Virtual key codes to ANSI escape sequences
 VK_MAP = {
@@ -150,26 +145,12 @@ class Unleashed:
         if self.stdin_handle and self.original_mode:
             kernel32.SetConsoleMode(self.stdin_handle, self.original_mode)
 
-    def _normalize_surrogates(self, text):
-        """Normalize UTF-16 surrogate pairs in a string.
-
-        Windows ReadConsoleInputW delivers emoji as separate surrogate pair
-        characters (U+D800-U+DFFF). pywinpty/pyo3 panics on these. This
-        normalizes them back to proper Unicode code points.
-        """
-        try:
-            return text.encode('utf-16', 'surrogatepass').decode('utf-16')
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return text  # Fall back to original if normalization fails
-
     def _pty_write_chunked(self, pty, data):
         """Write data to PTY in chunks to avoid winpty buffer overflow.
 
-        Also normalizes UTF-16 surrogate pairs to prevent pywinpty panic.
+        winpty/pyo3 has issues with string length assertions during UTF-16
+        conversion. Small chunks with delays prevent the race condition.
         """
-        # Normalize surrogate pairs from Windows console input
-        data = self._normalize_surrogates(data)
-
         offset = 0
         while offset < len(data):
             chunk = data[offset:offset + PTY_WRITE_CHUNK_SIZE]
@@ -300,13 +281,11 @@ class Unleashed:
 
                     sys.stdout.flush()
 
-                    # Use overlap buffer to catch pattern split across reads
                     search_chunk = self.overlap_buffer + raw_bytes
                     if not self.in_countdown and FOOTER_PATTERN in search_chunk:
                         self.do_approval(pty)
 
-                    # Keep enough overlap for the pattern
-                    self.overlap_buffer = raw_bytes[-64:]
+                    self.overlap_buffer = raw_bytes[-32:]
             except Exception:
                 break
 

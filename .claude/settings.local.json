@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(poetry install:*)",
+      "Bash(poetry env info:*)",
+      "Bash(poetry cache clear:*)"
+    ]
+  }
+}
