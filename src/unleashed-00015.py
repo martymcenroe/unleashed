@@ -302,6 +302,12 @@ class Unleashed:
 
                     # Use overlap buffer to catch pattern split across reads
                     search_chunk = self.overlap_buffer + raw_bytes
+
+                    # DEBUG: Log when we see "Esc to cancel" to capture actual bytes
+                    if b'Esc to cancel' in search_chunk:
+                        with open('C:/Users/mcwiz/Projects/unleashed/logs/pattern_debug.bin', 'wb') as f:
+                            f.write(search_chunk)
+
                     if not self.in_countdown and FOOTER_PATTERN in search_chunk:
                         self.do_approval(pty)
 
