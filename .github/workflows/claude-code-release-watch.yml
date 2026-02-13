@@ -1,0 +1,115 @@
+name: Claude Code Release Watch
+
+on:
+  schedule:
+    # Check every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  check-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get latest Claude Code release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Fetch latest release from anthropics/claude-code
+          RELEASE_JSON=$(gh release view --repo anthropics/claude-code --json tagName,body,publishedAt 2>/dev/null || echo '{}')
+
+          if [ "$RELEASE_JSON" = '{}' ]; then
+            echo "Failed to fetch release info"
+            exit 0
+          fi
+
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tagName')
+          BODY=$(echo "$RELEASE_JSON" | jq -r '.body')
+          PUBLISHED=$(echo "$RELEASE_JSON" | jq -r '.publishedAt')
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "published=$PUBLISHED" >> "$GITHUB_OUTPUT"
+
+          # Write body to file to preserve multiline content
+          echo "$BODY" > /tmp/release_body.md
+
+      - name: Check if already tracked
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+
+          if [ -z "$TAG" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Search for existing issue with this version tag
+          EXISTING=$(gh issue list --repo ${{ github.repository }} --search "Claude Code $TAG in:title" --json number --jq 'length')
+
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "Issue already exists for $TAG"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "New release: $TAG"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Analyze impact and open issue
+        if: steps.check.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.release.outputs.tag }}"
+          PUBLISHED="${{ steps.release.outputs.published }}"
+          BODY=$(cat /tmp/release_body.md)
+
+          # Keywords that may affect unleashed
+          IMPACT_LINES=""
+
+          # Pattern matching / TUI changes
+          while IFS= read -r line; do
+            line_lower=$(echo "$line" | tr '[:upper:]' '[:lower:]')
+            if echo "$line_lower" | grep -qiE 'terminal|layout|prompt|footer|narrow|width|resize|column'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **TUI/Layout**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'permission|approve|cancel|accept|reject|allow|deny'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Permissions**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'hook|pre-commit|settings|config'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Config/Hooks**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'streaming|output|display|render|ink|cursor'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Rendering**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'input|keyboard|key|shortcut|tab|escape|enter'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Input/Keys**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'pty|console|spawn|process|stdin|stdout'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **PTY/Process**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'agent|subagent|task|background'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Agents**: $line"
+            fi
+            if echo "$line_lower" | grep -qiE 'compact|context|session|resume|continue'; then
+              IMPACT_LINES="${IMPACT_LINES}\n- **Session**: $line"
+            fi
+          done <<< "$BODY"
+
+          # Build impact section
+          if [ -n "$IMPACT_LINES" ]; then
+            IMPACT_SECTION="## Potential Unleashed Impact\n\nThese changes may affect pattern matching, PTY handling, or approval detection:\n${IMPACT_LINES}\n\n**Action required:** Review flagged items. Test unleashed against this version before upgrading."
+          else
+            IMPACT_SECTION="## Potential Unleashed Impact\n\nNo obvious impact keywords detected. Still worth a quick smoke test."
+          fi
+
+          # Create the issue
+          gh issue create --repo ${{ github.repository }} \
+            --title "release: Claude Code $TAG — review for unleashed impact" \
+            --label "upstream" \
+            --body "$(printf '%s\n\n%s\n\n## Full Release Notes\n\n%s\n\n## Source\n\n[anthropics/claude-code %s](https://github.com/anthropics/claude-code/releases/tag/%s)\nPublished: %s' \
+              "A new Claude Code release has been published. Review for potential impact on unleashed." \
+              "$IMPACT_SECTION" \
+              "$BODY" \
+              "$TAG" "$TAG" "$PUBLISHED")"
