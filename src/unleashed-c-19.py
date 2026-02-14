@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Unleashed - v00019
-- Feature: Save PTY transcript to transcripts/ directory (gitignored)
+- Feature: Save PTY transcript to {cwd}/data/unleashed/ (gitignored per-project)
   Tees raw PTY output to {project}-{YYYYMMDD}-{HHMMSS}.raw
   Run clean_transcript.py post-session to clean.
 
@@ -113,10 +113,6 @@ TERM_RESET = (
     '\033[?1006l'   # Disable SGR mouse mode
 )
 
-# Transcript directory (relative to unleashed repo root)
-TRANSCRIPT_DIR = Path(__file__).parent.parent / 'transcripts'
-
-
 class Unleashed:
     def __init__(self, cwd=None):
         self.cwd = cwd or os.getcwd()
@@ -128,11 +124,12 @@ class Unleashed:
         self.transcript_file = None
 
     def _setup_transcript(self):
-        """Set up transcript file for this session."""
-        TRANSCRIPT_DIR.mkdir(exist_ok=True)
+        """Set up transcript file in the target project's data/unleashed/ dir."""
+        transcript_dir = Path(self.cwd) / 'data' / 'unleashed'
+        transcript_dir.mkdir(parents=True, exist_ok=True)
         project = Path(self.cwd).name
         timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-        path = TRANSCRIPT_DIR / f'{project}-{timestamp}.raw'
+        path = transcript_dir / f'{project}-{timestamp}.raw'
         self.transcript_file = open(path, 'ab')
         sys.stderr.write(f"[v{VERSION}] Transcript: {path}\n")
         sys.stderr.flush()
