@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Unleashed - v00015
+Unleashed - v00016
+- Fix: Update approval pattern for Claude Code Jan 2026 - "Tab to add" changed to "Tab to amend"
+
+v00015:
 - Fix: Normalize UTF-16 surrogate pairs before PTY write (fixes pywinpty panic on emoji paste)
 - Fix: More specific approval pattern - match "Esc to cancel · Tab" not just "Esc to cancel"
        This prevents false triggers on Resume Session picker and other UI screens
@@ -24,7 +27,7 @@ import shutil
 import ctypes
 from ctypes import wintypes
 
-VERSION = "00015"
+VERSION = "00016"
 
 # winpty write buffer limit - very small chunks to handle UTF-16 expansion on Windows
 PTY_WRITE_CHUNK_SIZE = 64  # Small to account for UTF-16 surrogate pairs
@@ -80,9 +83,10 @@ class INPUT_RECORD(ctypes.Structure):
 
 CLAUDE_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\claude.cmd"
 
-# Specific pattern for permission prompts - includes "Tab to add" to distinguish from other screens
+# Specific pattern for permission prompts - includes "Tab to amend" to distinguish from other screens
 # The middle dot (·) is U+00B7, encoded as \xc2\xb7 in UTF-8
-FOOTER_PATTERN = b'Esc to cancel \xc2\xb7 Tab to add'
+# Changed from "Tab to add" to "Tab to amend" in Claude Code ~Jan 2026
+FOOTER_PATTERN = b'Esc to cancel \xc2\xb7 Tab to amend'
 
 # Virtual key codes to ANSI escape sequences
 VK_MAP = {

@@ -17,6 +17,7 @@ Writes cleaned output to <filename>.clean — NEVER modifies the original.
 import argparse
 import re
 import sys
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import wordninja
@@ -607,7 +608,119 @@ def extract_user_input(lines: list[str]) -> list[str]:
     while user_lines and user_lines[-1] == '':
         user_lines.pop()
 
+    # Remove progressive typing repaints and duplicate blocks
+    user_lines, _ = dedup_typing_repaints(user_lines)
+
     return user_lines
+
+
+def dedup_typing_repaints(lines: list[str]) -> tuple[list[str], int]:
+    """Remove progressive typing repaints and duplicate blocks from user input.
+
+    When the user types while Claude is working, the terminal repaints
+    show progressively longer versions of the same message. Each repaint
+    is a prefix of the final complete message.
+
+    Also handles compaction replay duplicates: later blocks that are
+    truncated copies of earlier blocks.
+
+    Algorithm:
+    1. Split lines into blocks (separated by blank lines)
+    2. Normalize each block (strip whitespace + punctuation, lowercase, join)
+    3. Bidirectional prefix check:
+       - If block N is prefix of later block M: remove N (keep longer)
+       - If later block M is prefix of earlier block N: remove M (keep first)
+    4. Keep only the best version of each message
+    """
+    # Split into blocks
+    blocks = []  # list of (start_idx, [lines])
+    current_block = []
+    current_start = 0
+
+    for i, line in enumerate(lines):
+        if line.strip() == '':
+            if current_block:
+                blocks.append((current_start, current_block[:]))
+                current_block = []
+            current_start = i + 1
+        else:
+            if not current_block:
+                current_start = i
+            current_block.append(line)
+    if current_block:
+        blocks.append((current_start, current_block[:]))
+
+    if len(blocks) < 2:
+        return lines, 0
+
+    # Aggressive normalization: strip whitespace AND punctuation that gets
+    # dropped during word-merging (commas, periods, semicolons, colons)
+    def normalize_block(block_lines):
+        text = ''.join(block_lines).lower()
+        text = re.sub(r'[\s,.:;]+', '', text)
+        return text
+
+    block_norms = [normalize_block(b[1]) for b in blocks]
+
+    MIN_LEN = 15
+    MATCH_RATIO = 0.75  # 75% similarity threshold for fuzzy prefix match
+    remove_indices = set()
+
+    def is_fuzzy_prefix(shorter, longer):
+        """Check if shorter is an approximate prefix of longer.
+
+        Uses SequenceMatcher to handle typos and missing chars from
+        word-merged PTY text (e.g., 'wan' vs 'want').
+        """
+        if len(shorter) < MIN_LEN:
+            return False
+        # Compare shorter against the same-length start of longer
+        target = longer[:len(shorter) + max(5, len(shorter) // 5)]
+        return SequenceMatcher(None, shorter, target).ratio() >= MATCH_RATIO
+
+    for i in range(len(blocks)):
+        if i in remove_indices:
+            continue
+        norm_i = block_norms[i]
+        if len(norm_i) < MIN_LEN:
+            continue
+
+        for j in range(i + 1, len(blocks)):
+            if j in remove_indices:
+                continue
+            norm_j = block_norms[j]
+            if len(norm_j) < MIN_LEN:
+                continue
+
+            # Forward: earlier is approx prefix of later → remove earlier
+            if len(norm_i) <= len(norm_j) and is_fuzzy_prefix(norm_i, norm_j):
+                remove_indices.add(i)
+                break
+
+            # Reverse: later is approx prefix of earlier → remove later
+            if len(norm_j) < len(norm_i) and is_fuzzy_prefix(norm_j, norm_i):
+                remove_indices.add(j)
+
+    if not remove_indices:
+        return lines, 0
+
+    # Rebuild: keep only non-removed blocks, with blank separators
+    result = []
+    removed = 0
+
+    for bi, (start, block_lines) in enumerate(blocks):
+        if bi in remove_indices:
+            removed += len(block_lines)
+            continue
+        if result and result[-1] != '':
+            result.append('')
+        result.extend(block_lines)
+
+    # Remove trailing blank
+    while result and result[-1] == '':
+        result.pop()
+
+    return result, removed
 
 
 def fix_merged_spaces(line: str) -> str:
@@ -713,7 +826,7 @@ def clean_transcript(input_path: Path, fix_spaces: bool = False) -> tuple[Path, 
     output_path = input_path.with_suffix('.clean')
     output_path.write_text('\n'.join(kept) + '\n', encoding='utf-8')
 
-    # Extract user-input-only file
+    # Extract user-input-only file (includes typing repaint dedup)
     user_lines = extract_user_input(kept)
     user_path = input_path.with_suffix('.user')
     user_path.write_text('\n'.join(user_lines) + '\n', encoding='utf-8')

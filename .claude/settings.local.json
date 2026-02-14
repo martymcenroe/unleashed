@@ -3,7 +3,14 @@
     "allow": [
       "Bash(poetry install:*)",
       "Bash(poetry env info:*)",
-      "Bash(poetry cache clear:*)"
+      "Bash(poetry cache clear:*)",
+      "Bash(git -C /c/Users/mcwiz/Projects/unleashed remote:*)",
+      "Bash(gh issue list:*)",
+      "Bash(alias:*)",
+      "Bash(git -C /c/Users/mcwiz/Projects/unleashed checkout -- src/unleashed.py)",
+      "Bash(git -C /c/Users/mcwiz/Projects/unleashed status)",
+      "Bash(attrib +R \"C:\\\\Users\\\\mcwiz\\\\Projects\\\\unleashed\\\\src\\\\unleashed.py\")",
+      "Bash(attrib:*)"
     ]
   }
 }

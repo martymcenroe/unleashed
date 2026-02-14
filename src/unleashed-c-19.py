@@ -305,8 +305,9 @@ class Unleashed:
     def do_approval(self, pty):
         self.in_countdown = True
         self.overlap_buffer = b""
-        time.sleep(0.5)
+        time.sleep(0.1)
         pty.write('\r')
+        time.sleep(0.1)
         self.in_countdown = False
 
     def run(self):

@@ -1,19 +1,12 @@
 #!/usr/bin/env python3
 """
-Unleashed - v00015
-- Fix: Normalize UTF-16 surrogate pairs before PTY write (fixes pywinpty panic on emoji paste)
-- Fix: More specific approval pattern - match "Esc to cancel · Tab" not just "Esc to cancel"
-       This prevents false triggers on Resume Session picker and other UI screens
-- Fix: Chunk PTY writes to avoid winpty buffer panic on large paste
-- Fix: More conservative console mode - don't set ENABLE_WINDOW_INPUT (may interfere with Ink)
-- Fix: Use ReadConsoleInput API for larger paste buffer (bypass msvcrt limits)
-- Fix: Batch-read stdin to handle large pastes (fixes freeze on paste)
-- Fix: Add Shift+Tab support for mode cycling (plan mode, accept edits)
-- Fix: Force exit with sys.exit(0) to prevent hung terminal
-- Fix: Add full terminal reset (RIS) with \x1bc
-- Fix: Silent approval (removed countdown message that may interfere with Claude's TUI)
-- Fix: Set UNLEASHED_VERSION environment variable for Claude to detect
-- Arrow key fix: Map Windows key codes to ANSI escape sequences
+Unleashed-G - v17
+Gemini CLI auto-approval wrapper.
+
+Based on unleashed.py (Claude version) but adapted for Gemini CLI.
+
+- Pattern: "Waiting for user confirmation" (Gemini's permission prompt footer)
+- Command: gemini CLI
 """
 import os
 import sys
@@ -24,7 +17,7 @@ import shutil
 import ctypes
 from ctypes import wintypes
 
-VERSION = "00015"
+VERSION = "g-17"
 
 # winpty write buffer limit - very small chunks to handle UTF-16 expansion on Windows
 PTY_WRITE_CHUNK_SIZE = 64  # Small to account for UTF-16 surrogate pairs
@@ -78,11 +71,12 @@ class INPUT_RECORD(ctypes.Structure):
         ("Event", INPUT_RECORD_UNION),
     ]
 
-CLAUDE_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\claude.cmd"
+# Gemini CLI path
+GEMINI_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\gemini.cmd"
 
-# Specific pattern for permission prompts - includes "Tab to add" to distinguish from other screens
-# The middle dot (·) is U+00B7, encoded as \xc2\xb7 in UTF-8
-FOOTER_PATTERN = b'Esc to cancel \xc2\xb7 Tab to add'
+# Gemini permission prompt pattern
+# Gemini shows: "⠦ Waiting for user confirmation ..." (spinner varies)
+FOOTER_PATTERN = b'Waiting for user confirmation'
 
 # Virtual key codes to ANSI escape sequences
 VK_MAP = {
@@ -120,7 +114,7 @@ TERM_RESET = (
     '\033[?1006l'   # Disable SGR mouse mode
 )
 
-class Unleashed:
+class UnleashedG:
     def __init__(self, cwd=None):
         self.cwd = cwd or os.getcwd()
         self.running = True
@@ -302,12 +296,6 @@ class Unleashed:
 
                     # Use overlap buffer to catch pattern split across reads
                     search_chunk = self.overlap_buffer + raw_bytes
-
-                    # DEBUG: Log when we see "Esc to cancel" to capture actual bytes
-                    if b'Esc to cancel' in search_chunk:
-                        with open('C:/Users/mcwiz/Projects/unleashed/logs/pattern_debug.bin', 'wb') as f:
-                            f.write(search_chunk)
-
                     if not self.in_countdown and FOOTER_PATTERN in search_chunk:
                         self.do_approval(pty)
 
@@ -317,15 +305,16 @@ class Unleashed:
                 break
 
     def do_approval(self, pty):
+        """Auto-approve by sending '1' + Enter (selects 'Allow once')"""
         self.in_countdown = True
         self.overlap_buffer = b""
         time.sleep(0.5)
-        pty.write('\r')
+        pty.write('1\r')  # Select option 1: Allow once
         self.in_countdown = False
 
     def run(self):
-        # Startup banner - before Claude starts, so won't interfere
-        sys.stderr.write(f"[Unleashed v{VERSION}] Starting...\n")
+        # Startup banner - before Gemini starts, so won't interfere
+        sys.stderr.write(f"[Unleashed-G v{VERSION}] Starting...\n")
         sys.stderr.flush()
 
         self._setup_console()
@@ -343,7 +332,7 @@ class Unleashed:
 
         try:
             pty = winpty.PtyProcess.spawn(
-                ['cmd', '/c', CLAUDE_CMD],
+                ['cmd', '/c', GEMINI_CMD],
                 dimensions=(rows, cols),
                 cwd=self.cwd,
                 env=env
@@ -378,4 +367,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--cwd", default=None)
     args = parser.parse_args()
-    Unleashed(cwd=args.cwd).run()
+    UnleashedG(cwd=args.cwd).run()

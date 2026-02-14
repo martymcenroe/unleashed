@@ -27,3 +27,9 @@ logs/
 
 # Session transcripts (raw PTY output, cleaned by clean_transcript.py)
 transcripts/
+
+# Data files (transcripts, cleaned output — local only)
+data/
+
+# Personal redaction script
+src/redact.py

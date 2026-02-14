@@ -318,9 +318,9 @@ class UnleashedG:
         """
         self.in_approval = True
         self.overlap_buffer = b""
-        time.sleep(0.5)
+        time.sleep(0.1)
         pty.write('\r')
-        time.sleep(0.5)
+        time.sleep(0.1)
         self.in_approval = False
 
     def run(self):
