@@ -52,9 +52,3 @@ All session logs are stored in `logs/`:
 - `unleashed_YYYYMMDD_HHMMSS.log` - Raw session output
 - `unleashed_events_YYYYMMDD_HHMMSS.jsonl` - Structured event stream
 
-## Path Format Rules
-
-| Tool | Path Format | Example |
-|------|-------------|---------|
-| Bash | Unix-style | `/c/Users/mcwiz/Projects/unleashed/...` |
-| Read, Write, Edit, Glob | Windows-style | `C:\Users\mcwiz\Projects\unleashed\...` |
