@@ -260,7 +260,8 @@ def strip_ansi(data: bytes) -> bytes:
 PERMISSION_PATTERNS = [
     b'Tab to amend',
     b'Do you want to proceed?',
-    b'Allow this command to run?'
+    b'Allow this command to run?',
+    b'Do you want to allow Claude to fetch this content?',  # WebFetch domain approval
 ]
 
 # Model pause patterns — Claude stopping to ask pointless yes/no questions
