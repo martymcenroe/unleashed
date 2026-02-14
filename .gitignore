@@ -24,3 +24,6 @@ Thumbs.db
 
 # Logs (too large for GitHub, kept locally only)
 logs/
+
+# Session transcripts (raw PTY output, cleaned by clean_transcript.py)
+transcripts/
