@@ -543,6 +543,8 @@ class Unleashed:
         """Set up raw transcript file in the target project's data/unleashed/ dir."""
         transcript_dir = Path(self.cwd) / 'data' / 'unleashed'
         transcript_dir.mkdir(parents=True, exist_ok=True)
+        # Auto-cleanup: delete .raw files older than 7 days
+        self._cleanup_old_transcripts(transcript_dir)
         project = Path(self.cwd).name
         timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         path = transcript_dir / f'{project}-{timestamp}.raw'
@@ -550,6 +552,20 @@ class Unleashed:
         log(f"Transcript: {path}")
         sys.stderr.write(f"[v{VERSION}] Transcript: {path}\n")
         sys.stderr.flush()
+
+    def _cleanup_old_transcripts(self, transcript_dir: Path, max_age_days: int = 7):
+        """Delete .raw transcript files older than max_age_days."""
+        cutoff = time.time() - (max_age_days * 86400)
+        cleaned = 0
+        for f in transcript_dir.glob('*.raw'):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+                    cleaned += 1
+            except Exception:
+                pass
+        if cleaned:
+            log(f"Transcript cleanup: deleted {cleaned} files older than {max_age_days}d")
 
     def _close_transcript(self):
         """Close transcript file."""
