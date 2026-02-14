@@ -114,6 +114,13 @@ TIMESTAMP_FRAG_RE = re.compile(r'\d{0,2}:\d{2}[:\])]')  # leaked timestamp fragm
 # Rate-limit interval for mirror writes (seconds)
 MIRROR_FLUSH_INTERVAL = 0.2
 
+# Sentinel scope: which tool types go through the safety gate
+SENTINEL_SCOPES = {
+    "bash":  {"Bash"},
+    "write": {"Bash", "Write", "Edit"},
+    "all":   {"Bash", "Write", "Edit", "WebFetch", "WebSearch", "Skill", "Task"},
+}
+
 
 def mirror_strip_ansi(data: bytes) -> bytes:
     """Smart ANSI stripping for session mirror — cursor-tracking parser.
@@ -331,6 +338,15 @@ def extract_permission_context(buffer: str) -> str:
     # Fallback: last 200 chars
     return buffer[-200:].strip() if buffer else "(no context)"
 
+
+def extract_permission_context_structured(buffer: str) -> tuple:
+    """Extract structured (tool_type, tool_args, raw_context) for sentinel routing."""
+    matches = list(TOOL_CALL_RE.finditer(buffer))
+    if matches:
+        m = matches[-1]
+        return (m.group(1), m.group(2), f"{m.group(1)}({m.group(2)})")
+    return ("unknown", "", buffer[-200:].strip() if buffer else "(no context)")
+
 BASH_EXE = r"C:\Program Files\Git\usr\bin\bash.exe"
 
 def launch_tab(title: str, log_path: str):
@@ -515,7 +531,8 @@ class FrictionLogger:
 # ---------------------------------------------------------------------------
 
 class Unleashed:
-    def __init__(self, cwd=None, mirror=False, friction=False, joint_log=False, claude_args=None):
+    def __init__(self, cwd=None, mirror=False, friction=False, joint_log=False,
+                 sentinel_shadow=False, sentinel_scope=None, claude_args=None):
         self.cwd = cwd or os.getcwd()
         self.running = True
         self.in_approval = False
@@ -537,7 +554,12 @@ class Unleashed:
         # v21: rate-limited mirror writes
         self._mirror_buffer = b""
         self._mirror_last_flush = 0.0
-        log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, claude_args={self.claude_args})")
+        # v21: sentinel integration
+        self.sentinel_shadow = sentinel_shadow
+        self.sentinel_scope = sentinel_scope
+        self.sentinel_gate = None
+        self._shadow_fh = None
+        log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, sentinel_shadow={sentinel_shadow}, sentinel_scope={sentinel_scope}, claude_args={self.claude_args})")
 
     def _setup_transcript(self):
         """Set up raw transcript file in the target project's data/unleashed/ dir."""
@@ -780,7 +802,16 @@ class Unleashed:
                     if found_permission:
                         pattern_str = found_permission.decode('utf-8', errors='replace')
                         log(f"PERMISSION MATCHED: {found_permission!r}")
-                        context = extract_permission_context(self.context_buffer)
+                        tool_type, tool_args, context = extract_permission_context_structured(self.context_buffer)
+
+                        # Phase 0: Shadow logging — record what sentinel would see
+                        if self._shadow_fh:
+                            ts = time.strftime('%H:%M:%S')
+                            self._shadow_fh.write(f"--- [{ts}] ---\n")
+                            self._shadow_fh.write(f"Tool: {tool_type}\n")
+                            self._shadow_fh.write(f"Args: {tool_args[:300]}\n")
+                            self._shadow_fh.write(f"Context: {context[:300]}\n\n")
+                            self._shadow_fh.flush()
 
                         if self.friction_logger:
                             self.friction_logger.record_prompt(pattern_str, context, "permission_prompt")
@@ -788,7 +819,7 @@ class Unleashed:
                         if self.session_logger:
                             self.session_logger.write_event("PERMISSION", f"{pattern_str} | {context}")
 
-                        self.do_approval(pty)
+                        self.do_approval(pty, tool_type=tool_type, tool_args=tool_args)
 
                     else:
                         # 2. Check model pause patterns (Claude asking pointless yes/no)
@@ -820,15 +851,79 @@ class Unleashed:
                 log(f"PTY Reader Error: {e}")
                 break
 
-    def do_approval(self, pty):
-        log("Executing auto-approval...")
+    def do_approval(self, pty, tool_type="unknown", tool_args=""):
+        """Auto-approve permission prompt, optionally through sentinel gate."""
         self.in_approval = True
         self.overlap_buffer = b""
+
+        # Sentinel gate: check if this tool type is in scope
+        if self.sentinel_gate and self.sentinel_scope:
+            scope_tools = SENTINEL_SCOPES.get(self.sentinel_scope, set())
+            if tool_type in scope_tools:
+                log(f"SENTINEL CHECK: {tool_type}({tool_args[:100]})")
+                t = threading.Thread(
+                    target=self._sentinel_check,
+                    args=(pty, tool_type, tool_args),
+                    daemon=True
+                )
+                t.start()
+                return  # PTY reader resumes; in_approval stays True until sentinel thread finishes
+
+        # Default: instant approval
+        log("Executing auto-approval...")
         time.sleep(0.1)
         pty.write('\r')
         log("Sent CR to PTY")
         time.sleep(0.1)
         self.in_approval = False
+
+    def _sentinel_check(self, pty, tool_type, tool_args):
+        """Worker thread: call sentinel gate then approve or block."""
+        try:
+            start = time.time()
+            verdict, reason = self.sentinel_gate.check(tool_type, tool_args, self.cwd)
+            elapsed_ms = int((time.time() - start) * 1000)
+
+            if verdict == "ALLOW":
+                log(f"SENTINEL ALLOW ({elapsed_ms}ms): {tool_type}({tool_args[:100]})")
+                time.sleep(0.1)
+                pty.write('\r')
+                log("Sent CR to PTY (sentinel approved)")
+                time.sleep(0.1)
+
+            elif verdict == "BLOCK":
+                log(f"SENTINEL BLOCK ({elapsed_ms}ms): {reason} | {tool_type}({tool_args[:100]})")
+                # Do NOT send CR — user sees the permission prompt and decides manually
+                sys.stderr.write(f"\n\033[91m[SENTINEL] BLOCKED: {reason}\033[0m\n")
+                sys.stderr.flush()
+
+            else:  # ERROR — fail open
+                log(f"SENTINEL ERROR ({elapsed_ms}ms): {reason} | {tool_type}({tool_args[:100]})")
+                sys.stderr.write(f"\n\033[93m[SENTINEL] API error, fail-open: {reason[:80]}\033[0m\n")
+                sys.stderr.flush()
+                time.sleep(0.1)
+                pty.write('\r')
+                time.sleep(0.1)
+
+            if self.friction_logger:
+                self.friction_logger.record_prompt(
+                    f"sentinel:{verdict.lower()}",
+                    f"{tool_type}({tool_args[:200]}) ({elapsed_ms}ms)",
+                    "sentinel_check"
+                )
+
+        except Exception as e:
+            log(f"SENTINEL THREAD EXCEPTION: {e}")
+            # Fail open
+            try:
+                time.sleep(0.1)
+                pty.write('\r')
+                time.sleep(0.1)
+            except Exception:
+                pass
+
+        finally:
+            self.in_approval = False
 
     def _auto_answer(self, pty):
         """Auto-answer model pause questions by selecting option 1 (yes/proceed).
@@ -883,9 +978,34 @@ class Unleashed:
             self._close_transcript()
             return
 
-        # v18: Initialize loggers and launch companion tabs
+        # v21: Initialize sentinel shadow log
         session_ts = time.strftime("%Y%m%d-%H%M%S")
         session_id = f"unleashed-{session_ts}"
+
+        if self.sentinel_shadow:
+            shadow_path = os.path.join("logs", f"sentinel-shadow-{session_ts}.log")
+            self._shadow_fh = open(shadow_path, "a", encoding="utf-8")
+            self._shadow_fh.write(f"=== Sentinel Shadow Log — {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
+            self._shadow_fh.flush()
+            log(f"Sentinel shadow log: {shadow_path}")
+            sys.stderr.write(f"[v{VERSION}] Sentinel shadow: {shadow_path}\n")
+            sys.stderr.flush()
+
+        # v21: Initialize sentinel gate
+        if self.sentinel_scope:
+            sentinel_key = os.environ.get("AGENTOS_SENTINEL_KEY")
+            if sentinel_key:
+                from sentinel_gate import SentinelGate
+                self.sentinel_gate = SentinelGate(api_key=sentinel_key)
+                log(f"Sentinel gate enabled (scope={self.sentinel_scope})")
+                sys.stderr.write(f"[v{VERSION}] Sentinel gate: ACTIVE (scope={self.sentinel_scope})\n")
+                sys.stderr.flush()
+            else:
+                log("WARNING: --sentinel-scope set but AGENTOS_SENTINEL_KEY not found, running without sentinel")
+                sys.stderr.write(f"[v{VERSION}] WARNING: AGENTOS_SENTINEL_KEY not set, sentinel disabled\n")
+                sys.stderr.flush()
+
+        # v18: Initialize loggers and launch companion tabs
 
         if self.mirror:
             self.session_logger = SessionLogger(session_ts, self.joint_log)
@@ -923,6 +1043,13 @@ class Unleashed:
 
             # Close loggers and transcript before PTY termination
             self._close_transcript()
+            if self._shadow_fh:
+                self._shadow_fh.close()
+            if self.sentinel_gate:
+                stats = self.sentinel_gate.stats
+                log(f"Sentinel stats: {stats}")
+                sys.stderr.write(f"[v{VERSION}] Sentinel stats: {stats}\n")
+                sys.stderr.flush()
             if self.session_logger:
                 self.session_logger.close()
             if self.friction_logger:
@@ -937,13 +1064,17 @@ class Unleashed:
             sys.exit(0)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=f"Unleashed v{VERSION} — Shared Filter + Rate-Limited Mirror")
+    parser = argparse.ArgumentParser(description=f"Unleashed v{VERSION} — Shared Filter + Rate-Limited Mirror + Sentinel")
     parser.add_argument("--cwd", default=None, help="Working directory for Claude Code")
     parser.add_argument("--mirror", action="store_true", default=True, help="Open session mirror tab (default: on)")
     parser.add_argument("--no-mirror", action="store_false", dest="mirror", help="Disable session mirror tab")
     parser.add_argument("--friction", action="store_true", default=True, help="Open permission friction logger tab (default: on)")
     parser.add_argument("--no-friction", action="store_false", dest="friction", help="Disable permission friction logger tab")
     parser.add_argument("--joint-log", action="store_true", help="Include permissions inline in session mirror (implies --mirror)")
+    parser.add_argument("--sentinel-shadow", action="store_true", help="Log sentinel context for every approval (shadow mode, no API calls)")
+    parser.add_argument("--sentinel", action="store_true", help="Enable sentinel gate for Bash commands (alias for --sentinel-scope bash)")
+    parser.add_argument("--sentinel-scope", default=None, choices=["bash", "write", "all"],
+                        help="Enable sentinel gate: bash=Bash only, write=Bash+Write+Edit, all=all tools")
 
     # parse_known_args: unleashed flags are consumed, everything else passes to claude.cmd
     args, claude_args = parser.parse_known_args()
@@ -952,10 +1083,17 @@ if __name__ == "__main__":
     if args.joint_log:
         args.mirror = True
 
+    # --sentinel is alias for --sentinel-scope bash
+    sentinel_scope = args.sentinel_scope
+    if args.sentinel and not sentinel_scope:
+        sentinel_scope = "bash"
+
     Unleashed(
         cwd=args.cwd,
         mirror=args.mirror,
         friction=args.friction,
         joint_log=args.joint_log,
+        sentinel_shadow=args.sentinel_shadow,
+        sentinel_scope=sentinel_scope,
         claude_args=claude_args
     ).run()
