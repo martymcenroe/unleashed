@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+"""
+Unleashed - v00020
+- New: Raw transcript save to {cwd}/data/unleashed/ (per-project, gitignored)
+  Tees raw PTY output to {project}-{YYYYMMDD}-{HHMMSS}.raw
+  Run clean_transcript.py post-session to clean.
+- Fix: Approval timing reduced from 0.5s to 0.1s (below human perception threshold)
+- Carries forward all v18 features: mirror, friction, joint-log, resize, model pause
+
+Based on v00018 "Triplet Tabs".
+"""
+import os
+import sys
+import threading
+import time
+import argparse
+import shutil
+import ctypes
+import re
+from collections import deque
+import json
+import datetime
+import subprocess
+from pathlib import Path
+from ctypes import wintypes
+
+VERSION = "00020"
+LOG_FILE = os.path.join("logs", f"unleashed_v{VERSION}.log")
+
+# winpty write buffer limit
+PTY_WRITE_CHUNK_SIZE = 64
+
+try:
+    import winpty
+except ImportError:
+    sys.stderr.write(f"[v{VERSION}] FATAL: pywinpty missing.\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+def log(msg):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+
+# Windows API setup
+kernel32 = ctypes.windll.kernel32
+STD_INPUT_HANDLE = -10
+KEY_EVENT = 0x0001
+ENABLE_EXTENDED_FLAGS = 0x0080
+ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+
+class KEY_EVENT_RECORD(ctypes.Structure):
+    _fields_ = [
+        ("bKeyDown", wintypes.BOOL),
+        ("wRepeatCount", wintypes.WORD),
+        ("wVirtualKeyCode", wintypes.WORD),
+        ("wVirtualScanCode", wintypes.WORD),
+        ("uChar", wintypes.WCHAR),
+        ("dwControlKeyState", wintypes.DWORD),
+    ]
+
+class INPUT_RECORD_UNION(ctypes.Union):
+    _fields_ = [
+        ("KeyEvent", KEY_EVENT_RECORD),
+        ("_padding", ctypes.c_byte * 16),
+    ]
+
+class INPUT_RECORD(ctypes.Structure):
+    _fields_ = [
+        ("EventType", wintypes.WORD),
+        ("Event", INPUT_RECORD_UNION),
+    ]
+
+CLAUDE_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\claude.cmd"
+
+# Regex to strip ANSI escape sequences from raw bytes before pattern matching.
+ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b[A-Za-z]')
+
+MULTI_SPACE_RE = re.compile(rb' {2,}')
+
+# ---------------------------------------------------------------------------
+# Session mirror filtering
+# ---------------------------------------------------------------------------
+
+# Broader ANSI regex for mirror: catches private mode sequences (\x1b[?25h etc.)
+# that the pattern-matching ANSI_RE misses.  [\x20-\x3f]* covers the full ECMA-48
+# "intermediate bytes" range: digits, semicolons, ?, >, =, etc.
+MIRROR_ANSI_RE = re.compile(
+    rb'\x1b\[[\x20-\x3f]*[A-Za-z~]'   # CSI sequences (including ?-prefixed)
+    rb'|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)'  # OSC sequences (BEL or ST terminator)
+    rb'|\x1b[()][AB012]'               # character set selection
+    rb'|\x1b[A-Za-z]'                  # two-char ESC sequences
+)
+# Orphaned escape sequence payloads: when \x1b is in one PTY read and the
+# parameter bytes are in the next, we get bare ]0;title or [25;10H in the text.
+# \x1b itself gets stripped by MIRROR_CONTROL_RE, but the payload survives.
+# These regexes clean them from anywhere in the line (mid-line or start).
+ORPHAN_CSI_RE = re.compile(r'\[[\d;?]+[A-Za-z~]')   # [25;10H, [2J, [?25h (needs digits)
+ORPHAN_OSC_RE = re.compile(r'\]\d;.*')              # ]0;window title... (eats whole line)
+# Control chars that cause overwrite behavior in tail -f.
+# \r = carriage return (cursor to column 0 — overwrites current line)
+# \x08 = backspace, \x07 = BEL, etc.   Keep only \n (0x0a).
+MIRROR_CONTROL_RE = re.compile(rb'[\x00-\x09\x0b-\x1f\x7f]')
+
+SPINNER_PREFIX_RE = re.compile(r'^[*✶✻✽·✢●]\s*')
+SEPARATOR_RE = re.compile(r'^[\s─━═╌╍┄┅]{8,}$')  # mostly box-drawing (allows spaces)
+TIMESTAMP_FRAG_RE = re.compile(r'\d{0,2}:\d{2}[:\])]')  # leaked timestamp fragments
+
+
+def mirror_strip_ansi(data: bytes) -> bytes:
+    """Smart ANSI stripping for session mirror — cursor-tracking parser.
+
+    The Ink TUI uses cursor positioning codes as whitespace between words:
+        \\x1b[7;1HIt\\x1b[7;4His  →  "It" at col 1, "is" at col 4
+    The gap from col 3→4 IS the space.  But it also positions characters
+    individually for styled elements:
+        \\x1b[5;20HC\\x1b[5;21Hl\\x1b[5;22Ha  →  C at 20, l at 21, a at 22
+    No gaps — they're adjacent.
+
+    DELETE strips both, giving "Itis" and "Claude" — words merge.
+    REPLACE inserts spaces for both, giving "It is" and "C l a u d e".
+    Neither works alone.
+
+    This parser tracks cursor column position:
+      - Column jump past current position → insert space (word gap)
+      - Column matches current position  → nothing (adjacent character)
+      - Row change → newline
+      - All non-positioning ANSI → deleted
+      - Control chars (except \\n) → deleted
+    """
+    result = []
+    row = 0
+    col = 0
+    pos = 0
+    length = len(data)
+
+    while pos < length:
+        byte = data[pos]
+
+        # --- ESC sequence ---
+        if byte == 0x1b and pos + 1 < length:
+            next_byte = data[pos + 1]
+
+            if next_byte == 0x5b:  # '[' → CSI sequence
+                # Consume parameter + intermediate bytes (0x20–0x3f)
+                end = pos + 2
+                while end < length and 0x20 <= data[end] <= 0x3f:
+                    end += 1
+                # Final byte (0x40–0x7e)
+                if end < length and 0x40 <= data[end] <= 0x7e:
+                    final = data[end]
+                    param_bytes = data[pos + 2:end]
+                    end += 1
+
+                    # Cursor Position: \x1b[row;colH or \x1b[row;colf
+                    if final in (0x48, 0x66):  # H or f
+                        params = param_bytes.split(b';')
+                        new_row = int(params[0]) if params[0] else 1
+                        new_col = int(params[1]) if len(params) > 1 and params[1] else 1
+                        if new_row != row:
+                            if result and result[-1] != b'\n':
+                                result.append(b'\n')
+                            row = new_row
+                        elif new_col > col:
+                            result.append(b' ')
+                        col = new_col
+
+                    # Cursor Horizontal Absolute: \x1b[colG
+                    elif final == 0x47:  # G
+                        new_col = int(param_bytes) if param_bytes else 1
+                        if new_col > col:
+                            result.append(b' ')
+                        col = new_col
+
+                    # Cursor Forward: \x1b[nC
+                    elif final == 0x43:  # C
+                        n = int(param_bytes) if param_bytes else 1
+                        if n > 1:
+                            result.append(b' ')
+                        col += n
+
+                    # Cursor Up/Down: row change → newline
+                    elif final in (0x41, 0x42):  # A (up) or B (down)
+                        n = int(param_bytes) if param_bytes else 1
+                        row = row - n if final == 0x41 else row + n
+                        if result and result[-1] != b'\n':
+                            result.append(b'\n')
+
+                    # All other CSI (colors, erase, scroll, etc.) — skip
+
+                    pos = end
+                    continue
+                else:
+                    pos = end if end < length else end
+                    continue
+
+            elif next_byte == 0x5d:  # ']' → OSC sequence
+                end = pos + 2
+                while end < length:
+                    if data[end] == 0x07:  # BEL terminator
+                        end += 1
+                        break
+                    if data[end] == 0x1b and end + 1 < length and data[end + 1] == 0x5c:
+                        end += 2  # ST terminator
+                        break
+                    end += 1
+                pos = end
+                continue
+
+            elif next_byte in (0x28, 0x29):  # charset selection
+                pos = min(pos + 3, length)
+                continue
+
+            else:  # other ESC + letter
+                pos += 2
+                continue
+
+        # --- Newline ---
+        if byte == 0x0a:
+            if result and result[-1] != b'\n':
+                result.append(b'\n')
+            row += 1
+            col = 0
+            pos += 1
+            continue
+
+        # --- Other control chars: skip ---
+        if byte < 0x20 or byte == 0x7f:
+            pos += 1
+            continue
+
+        # --- Printable byte: output and advance column ---
+        result.append(data[pos:pos + 1])
+        col += 1
+        pos += 1
+
+    return b''.join(result)
+
+
+def strip_ansi(data: bytes) -> bytes:
+    """Replace ANSI escape sequences with a space to preserve word boundaries.
+
+    Cursor positioning codes (\x1b[row;colH) ARE the whitespace between words
+    in the TUI. Simply deleting them merges words: 'Tabtoamend'. Replacing with
+    a space then collapsing keeps: 'Tab to amend'.
+    """
+    result = ANSI_RE.sub(b' ', data)
+    result = MULTI_SPACE_RE.sub(b' ', result)
+    return result
+
+# Permission prompt patterns (TUI system dialogs)
+PERMISSION_PATTERNS = [
+    b'Tab to amend',
+    b'Do you want to proceed?',
+    b'Allow this command to run?'
+]
+
+# Model pause patterns — Claude stopping to ask pointless yes/no questions
+# These are AskUserQuestion tool renders or conversational pauses
+MODEL_PAUSE_PATTERNS = [
+    b'Should I proceed',
+    b'Should I continue',
+    b'Would you like me to proceed',
+    b'Would you like me to continue',
+    b'Shall I proceed',
+    b'Shall I continue',
+    b'Want me to proceed',
+    b'Want me to continue',
+    b'Do you want me to proceed',
+    b'Do you want me to continue',
+    b'Ready to proceed',
+    b'Is my plan ready',
+]
+
+# Noise patterns to filter from session mirror (applied to ANSI-stripped text)
+NOISE_RE = [
+    re.compile(r'^\s*$'),
+    re.compile(r'^[\u2500\u2550]{10,}$'),   # ─ or ═ horizontal rules
+    re.compile(r'^\xb7\s+\S+ing'),           # · spinner lines (middle dot)
+    re.compile(r'^\s*\d+ files? '),           # file count status
+]
+
+# Extract tool call that triggered a permission prompt
+TOOL_CALL_RE = re.compile(
+    r'(Read|Write|Edit|Bash|Glob|Grep|WebFetch|WebSearch|Skill|Task|NotebookEdit)\(([^)]{1,500})\)',
+    re.DOTALL
+)
+
+VK_MAP = {
+    0x26: '\x1b[A', 0x28: '\x1b[B', 0x25: '\x1b[D', 0x27: '\x1b[C',
+    0x24: '\x1b[H', 0x23: '\x1b[F', 0x2D: '\x1b[2~', 0x2E: '\x1b[3~',
+    0x21: '\x1b[5~', 0x22: '\x1b[6~', 0x70: '\x1bOP', 0x71: '\x1bOQ',
+    0x72: '\x1bOR', 0x73: '\x1bOS', 0x74: '\x1b[15~', 0x75: '\x1b[17~',
+    0x76: '\x1b[18~', 0x77: '\x1b[19~', 0x78: '\x1b[20~', 0x79: '\x1b[21~',
+    0x7A: '\x1b[23~', 0x7B: '\x1b[24~',
+}
+
+TERM_RESET = '\033[0m\033[?25h\033[?1000l\033[?1002l\033[?1003l\033[?1006l'
+
+# ANSI color codes for session mirror categories
+COLORS = {
+    'user':       '\033[32m',    # green
+    'assistant':  '\033[36m',    # cyan
+    'tool':       '\033[2m',     # dim
+    'permission': '\033[33m',    # yellow
+    'reset':      '\033[0m',
+}
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def classify_line(line: str) -> str:
+    """Classify a cleaned line for colorization in the session mirror."""
+    stripped = line.strip()
+    if stripped.startswith('\u276f ') or stripped.startswith('> '):   # ❯ or >
+        return 'user'
+    if stripped.startswith('\u25cf') or stripped.startswith('\u23bf'):  # ● or ⎿
+        return 'tool'
+    if any(kw in stripped for kw in ('Do you want to proceed?', 'Allow this command to run?', 'Tab to amend', 'Esc to cancel')):
+        return 'permission'
+    return 'assistant'
+
+def extract_permission_context(buffer: str) -> str:
+    """Extract the tool call that triggered a permission prompt from recent PTY text."""
+    matches = list(TOOL_CALL_RE.finditer(buffer))
+    if matches:
+        m = matches[-1]
+        return f"{m.group(1)}({m.group(2)})"
+    # Fallback: last 200 chars
+    return buffer[-200:].strip() if buffer else "(no context)"
+
+BASH_EXE = r"C:\Program Files\Git\usr\bin\bash.exe"
+
+def launch_tab(title: str, log_path: str):
+    """Launch a Windows Terminal tab tailing the given log file."""
+    try:
+        abs_path = os.path.abspath(log_path)
+        # Convert Windows path to Unix for Git Bash tail
+        unix_path = abs_path.replace("\\", "/")
+        if unix_path[1] == ':':
+            unix_path = '/' + unix_path[0].lower() + unix_path[2:]
+
+        # Must use full path to bash.exe — Git Bash isn't in the Windows system PATH
+        cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "tail -f \'{unix_path}\'"'
+        log(f"Launching tab: {cmd}")
+        subprocess.Popen(cmd, shell=True)
+    except Exception as e:
+        log(f"WARNING: Failed to launch tab '{title}': {e}")
+
+def is_noise(line: str) -> bool:
+    """Check if a line is TUI noise that should be filtered from the session mirror."""
+    for pattern in NOISE_RE:
+        if pattern.match(line):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# SessionLogger — Tab 2: timestamped, colorized transcript
+# ---------------------------------------------------------------------------
+
+SESSION_MIRROR_MAX_LINES = 10_000
+SESSION_MIRROR_KEEP_LINES = 7_000  # After truncation, keep this many recent lines
+
+
+class SessionLogger:
+    def __init__(self, session_ts: str, joint_log: bool):
+        self.path = os.path.join("logs", f"session-{session_ts}.log")
+        self.joint_log = joint_log
+        self.line_count = 0
+        self.fh = open(self.path, "a", encoding="utf-8")
+        self.fh.write(f"{'='*60}\n")
+        self.fh.write(f"  Unleashed v{VERSION} Session Mirror\n")
+        self.fh.write(f"  Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.fh.write(f"  Joint log (permissions inline): {joint_log}\n")
+        self.fh.write(f"{'='*60}\n\n")
+        self.fh.flush()
+        self.line_count = 6
+
+    def _truncate_if_needed(self):
+        """Truncate mirror to keep only recent lines when it exceeds the cap."""
+        if self.line_count < SESSION_MIRROR_MAX_LINES:
+            return
+        try:
+            self.fh.flush()
+            self.fh.close()
+            with open(self.path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            keep = lines[-SESSION_MIRROR_KEEP_LINES:]
+            with open(self.path, "w", encoding="utf-8") as f:
+                f.write(f"[--- truncated {len(lines) - len(keep)} older lines ---]\n")
+                f.writelines(keep)
+            self.fh = open(self.path, "a", encoding="utf-8")
+            self.line_count = len(keep) + 1
+            log(f"Session mirror truncated: {len(lines)} -> {self.line_count} lines")
+        except Exception as e:
+            log(f"Session mirror truncation failed: {e}")
+            self.fh = open(self.path, "a", encoding="utf-8")
+
+    def write_raw(self, text: str):
+        """Write text to log. No timestamps — mirror is a live tail."""
+        lines = text.split('\n')
+        for i, line in enumerate(lines):
+            if i < len(lines) - 1:
+                self.fh.write(f"{line}\n")
+                self.line_count += 1
+            elif line:
+                self.fh.write(line)
+        self.fh.flush()
+        self._truncate_if_needed()
+
+    def write_event(self, event_type: str, detail: str):
+        """Write a highlighted event (permission, model pause, etc)."""
+        c = COLORS['permission']
+        r = COLORS['reset']
+        self.fh.write(f"\n{c}>>> [{event_type}] {detail}{r}\n\n")
+        self.fh.flush()
+        self.line_count += 3
+
+    def close(self):
+        if self.fh and not self.fh.closed:
+            self.fh.write(f"\n{'='*60}\n")
+            self.fh.write(f"  Session ended: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.fh.write(f"{'='*60}\n")
+            self.fh.flush()
+            self.fh.close()
+
+
+# ---------------------------------------------------------------------------
+# FrictionLogger — Tab 3: permission prompt tracking
+# ---------------------------------------------------------------------------
+
+class FrictionLogger:
+    def __init__(self, session_ts: str, session_id: str):
+        self.human_path = os.path.join("logs", f"friction-{session_ts}.log")
+        self.jsonl_path = os.path.join("logs", f"friction-{session_ts}.jsonl")
+        self.session_id = session_id
+        self.session_start = time.time()
+        self.prompt_count = 0
+        self.fh_human = open(self.human_path, "a", encoding="utf-8")
+        self.fh_jsonl = open(self.jsonl_path, "a", encoding="utf-8")
+        self.fh_human.write(f"{'='*60}\n")
+        self.fh_human.write(f"  Permission Friction Logger — {session_id}\n")
+        self.fh_human.write(f"  Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        self.fh_human.write(f"{'='*60}\n\n")
+        self.fh_human.write("Waiting for permission prompts...\n\n")
+        self.fh_human.flush()
+
+    def record_prompt(self, pattern_matched: str, raw_context: str, event_type: str = "permission_prompt"):
+        self.prompt_count += 1
+        now = time.time()
+        elapsed = int(now - self.session_start)
+
+        # JSONL record
+        record = {
+            "ts": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "session_id": self.session_id,
+            "elapsed_s": elapsed,
+            "type": event_type,
+            "pattern_matched": pattern_matched,
+            "raw_context": raw_context,
+            "auto_approved": True,
+            "prompt_number": self.prompt_count
+        }
+        self.fh_jsonl.write(json.dumps(record) + "\n")
+        self.fh_jsonl.flush()
+
+        # Human-readable
+        ts = time.strftime('%H:%M:%S')
+        label = "Permission" if event_type == "permission_prompt" else "Model Pause"
+        self.fh_human.write(f"--- {label} #{self.prompt_count} ---\n")
+        self.fh_human.write(f"[{ts}] Type: {event_type}\n")
+        self.fh_human.write(f"[{ts}] Pattern: {pattern_matched}\n")
+        self.fh_human.write(f"[{ts}] Context: {raw_context}\n")
+        self._write_tally()
+        self.fh_human.write("\n")
+        self.fh_human.flush()
+
+    def _write_tally(self):
+        elapsed = time.time() - self.session_start
+        elapsed_min = elapsed / 60
+        if self.prompt_count > 0:
+            rate_s = elapsed / self.prompt_count
+            if rate_s >= 60:
+                rate_str = f"1 every {rate_s / 60:.1f}m"
+            else:
+                rate_str = f"1 every {rate_s:.0f}s"
+        else:
+            rate_str = "n/a"
+        self.fh_human.write(
+            f"[PROMPTS: {self.prompt_count} | SESSION: {elapsed_min:.0f}m | RATE: {rate_str}]\n"
+        )
+
+    def close(self):
+        # Write final summary
+        elapsed = time.time() - self.session_start
+        elapsed_min = elapsed / 60
+        summary = (
+            f"\n{'='*60}\n"
+            f"  SESSION SUMMARY\n"
+            f"  Duration: {elapsed_min:.1f} minutes\n"
+            f"  Total permission prompts: {self.prompt_count}\n"
+        )
+        if self.prompt_count > 0:
+            rate = elapsed / self.prompt_count
+            summary += f"  Average rate: 1 every {rate:.0f}s ({rate/60:.1f}m)\n"
+        summary += f"  JSONL data: {self.jsonl_path}\n"
+        summary += f"{'='*60}\n"
+
+        self.fh_human.write(summary)
+        self.fh_human.flush()
+
+        for fh in (self.fh_human, self.fh_jsonl):
+            if fh and not fh.closed:
+                fh.close()
+
+
+# ---------------------------------------------------------------------------
+# Main Unleashed class
+# ---------------------------------------------------------------------------
+
+class Unleashed:
+    def __init__(self, cwd=None, mirror=False, friction=False, joint_log=False, claude_args=None):
+        self.cwd = cwd or os.getcwd()
+        self.running = True
+        self.in_approval = False
+        self.overlap_buffer = b""
+        self.stdin_handle = None
+        self.original_mode = None
+        # v18: tab features
+        self.mirror = mirror
+        self.friction = friction
+        self.joint_log = joint_log
+        self.claude_args = claude_args or []  # extra args passed through to claude.cmd
+        self.session_logger = None
+        self.friction_logger = None
+        self.context_buffer = ""         # last 2048 chars of stripped PTY text
+        self._mirror_recent = deque(maxlen=32)  # recent lines for mirror dedup
+        self._last_auto_answer_time = 0  # cooldown: prevent _auto_answer loop
+        # v20: raw transcript save
+        self.transcript_file = None
+        log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, claude_args={self.claude_args})")
+
+    def _setup_transcript(self):
+        """Set up raw transcript file in the target project's data/unleashed/ dir."""
+        transcript_dir = Path(self.cwd) / 'data' / 'unleashed'
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        project = Path(self.cwd).name
+        timestamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        path = transcript_dir / f'{project}-{timestamp}.raw'
+        self.transcript_file = open(path, 'ab')
+        log(f"Transcript: {path}")
+        sys.stderr.write(f"[v{VERSION}] Transcript: {path}\n")
+        sys.stderr.flush()
+
+    def _close_transcript(self):
+        """Close transcript file."""
+        if self.transcript_file:
+            self.transcript_file.close()
+            self.transcript_file = None
+
+    def _setup_console(self):
+        self.stdin_handle = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        self.original_mode = wintypes.DWORD()
+        kernel32.GetConsoleMode(self.stdin_handle, ctypes.byref(self.original_mode))
+        new_mode = ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
+        kernel32.SetConsoleMode(self.stdin_handle, new_mode)
+
+    def _restore_console(self):
+        if self.stdin_handle and self.original_mode:
+            kernel32.SetConsoleMode(self.stdin_handle, self.original_mode)
+
+    def _normalize_surrogates(self, text):
+        try:
+            return text.encode('utf-16', 'surrogatepass').decode('utf-16')
+        except:
+            return text
+
+    def _pty_write_chunked(self, pty, data):
+        data = self._normalize_surrogates(data)
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset:offset + PTY_WRITE_CHUNK_SIZE]
+            pty.write(chunk)
+            offset += PTY_WRITE_CHUNK_SIZE
+            if offset < len(data):
+                time.sleep(0.001)
+
+    def _reader_stdin(self, pty):
+        max_events = 1024
+        input_buffer = (INPUT_RECORD * max_events)()
+        events_read = wintypes.DWORD()
+        while self.running:
+            try:
+                events_available = wintypes.DWORD()
+                kernel32.GetNumberOfConsoleInputEvents(self.stdin_handle, ctypes.byref(events_available))
+                if events_available.value == 0:
+                    time.sleep(0.005)
+                    continue
+                success = kernel32.ReadConsoleInputW(self.stdin_handle, input_buffer, max_events, ctypes.byref(events_read))
+                if not success or events_read.value == 0:
+                    time.sleep(0.005)
+                    continue
+                output_chars = []
+                for i in range(events_read.value):
+                    record = input_buffer[i]
+                    if record.EventType != KEY_EVENT: continue
+                    key_event = record.Event.KeyEvent
+                    if not key_event.bKeyDown: continue
+                    vk = key_event.wVirtualKeyCode
+                    char = key_event.uChar
+                    ctrl_state = key_event.dwControlKeyState
+                    left_ctrl = ctrl_state & 0x0008
+                    right_ctrl = ctrl_state & 0x0004
+                    shift = ctrl_state & 0x0010
+                    if vk == 0x43 and (left_ctrl or right_ctrl):
+                        self.running = False
+                        return
+                    if vk == 0x1B: output_chars.append('\x1b'); continue
+                    if vk == 0x09 and shift: output_chars.append('\x1b[Z'); continue
+                    if vk == 0x09: output_chars.append('\t'); continue
+                    if vk == 0x0D: output_chars.append('\r'); continue
+                    if vk == 0x08: output_chars.append('\x7f'); continue
+                    if vk in VK_MAP: output_chars.append(VK_MAP[vk]); continue
+                    if left_ctrl or right_ctrl:
+                        if 0x41 <= vk <= 0x5A:
+                            output_chars.append(chr(vk - 0x40))
+                            continue
+                    if char and ord(char) > 0: output_chars.append(char)
+                if output_chars:
+                    self._pty_write_chunked(pty, ''.join(output_chars))
+            except: break
+
+    def _resize_monitor(self, pty):
+        """Poll for terminal resize and forward new dimensions to PTY."""
+        last_size = shutil.get_terminal_size((120, 40))
+        last_cols, last_rows = last_size.columns, last_size.lines
+        log(f"Resize monitor started: {last_cols}x{last_rows}")
+        while self.running and pty.isalive():
+            try:
+                cur_size = shutil.get_terminal_size((last_cols, last_rows))
+                cur_cols, cur_rows = cur_size.columns, cur_size.lines
+                if cur_cols != last_cols or cur_rows != last_rows:
+                    log(f"Terminal resized: {last_cols}x{last_rows} -> {cur_cols}x{cur_rows}")
+                    pty.setwinsize(cur_rows, cur_cols)
+                    last_cols, last_rows = cur_cols, cur_rows
+                time.sleep(0.3)
+            except Exception as e:
+                log(f"Resize monitor error: {e}")
+                break
+
+    def _log_to_mirror(self, raw_data):
+        """Write filtered PTY output to session mirror as clean scrollable log.
+
+        The Ink TUI repaints the ENTIRE screen on every spinner tick and every
+        streamed character.  A single 8 KB PTY read produces:
+          - cursor-home + clear-screen codes (overwrite in tail -f)
+          - \\r carriage returns (overwrite current line in tail -f)
+          - dozens of blank lines (cleared screen regions)
+          - spinner animation frames (*, ✶, ✻, ✽, ·, ✢ cycling)
+          - the SAME content with a different spinner prefix each tick
+          - single-char progressive text fragments (S, Sk, Ske ...)
+          - repeated separator lines (─────────)
+          - garbled timestamp fragments from the status bar
+
+        We use mirror_strip_ansi() — a cursor-tracking parser that inserts
+        spaces only at word gaps (column jumps past current position) while
+        preserving adjacent characters.  Then line-level filters handle
+        noise: min length, separator filter, timestamp filter, and dedup.
+        """
+        if not self.session_logger:
+            return
+        try:
+            if isinstance(raw_data, str):
+                raw_bytes = raw_data.encode('utf-8', errors='ignore')
+            else:
+                raw_bytes = raw_data
+
+            # Smart ANSI stripping: cursor-tracking parser that distinguishes
+            # word gaps (col jump > current → space) from adjacent characters
+            # (col matches current → nothing).  Handles both "It is" and "Claude".
+            clean = mirror_strip_ansi(raw_bytes)
+            text = clean.decode('utf-8', errors='replace')
+
+            fh = self.session_logger.fh
+            wrote = False
+            for line in text.split('\n'):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                # Strip orphaned escape sequence payloads spanning PTY reads
+                stripped = ORPHAN_CSI_RE.sub('', stripped)
+                stripped = ORPHAN_OSC_RE.sub('', stripped)
+                stripped = stripped.strip()
+                if not stripped:
+                    continue
+
+                # Strip leading spinner character for normalization
+                normalized = SPINNER_PREFIX_RE.sub('', stripped).strip()
+
+                # Skip short fragments (progressive render, garbled TUI pieces)
+                if len(normalized) < 12:
+                    continue
+
+                # Skip separator lines (box-drawing, possibly with spaces mixed in)
+                if SEPARATOR_RE.match(normalized):
+                    continue
+
+                # Skip lines that are mostly leaked timestamp fragments
+                # e.g. "h g44:29]", "98:44:29]", "ng4:29]"
+                if TIMESTAMP_FRAG_RE.search(normalized) and len(normalized) < 30:
+                    continue
+
+                # Deduplicate against recent lines
+                if normalized in self._mirror_recent:
+                    continue
+
+                self._mirror_recent.append(normalized)
+                fh.write(f"{stripped}\n")
+                wrote = True
+
+            if wrote:
+                fh.flush()
+        except Exception as e:
+            log(f"Mirror write error: {e}")
+
+    def _reader_pty(self, pty):
+        while self.running and pty.isalive():
+            try:
+                data = pty.read(8192)
+                if not data: continue
+                if isinstance(data, str):
+                    raw_bytes = data.encode('utf-8', errors='ignore')
+                    sys.stdout.write(data)
+                else:
+                    raw_bytes = data
+                    sys.stdout.buffer.write(data)
+                sys.stdout.flush()
+
+                # v20: tee to raw transcript file
+                if self.transcript_file:
+                    self.transcript_file.write(raw_bytes)
+                    self.transcript_file.flush()
+
+                search_chunk = self.overlap_buffer + raw_bytes
+                clean_chunk = strip_ansi(search_chunk)
+
+                # Update context buffer for friction/pause context (human-readable).
+                # Uses cursor-tracking parser — not strip_ansi() which adds
+                # spurious spaces from character-by-character TUI rendering.
+                mirror_text = mirror_strip_ansi(raw_bytes).decode('utf-8', errors='replace')
+                self.context_buffer = (self.context_buffer + mirror_text)[-2048:]
+
+                # Write ANSI-stripped output to session mirror (clean scrollable log)
+                self._log_to_mirror(data)
+
+                # Matching logic — permission prompts and model pauses
+                if not self.in_approval:
+                    # 1. Check permission prompt patterns
+                    found_permission = None
+                    for p in PERMISSION_PATTERNS:
+                        if p in clean_chunk:
+                            found_permission = p
+                            break
+
+                    if found_permission:
+                        pattern_str = found_permission.decode('utf-8', errors='replace')
+                        log(f"PERMISSION MATCHED: {found_permission!r}")
+                        context = extract_permission_context(self.context_buffer)
+
+                        if self.friction_logger:
+                            self.friction_logger.record_prompt(pattern_str, context, "permission_prompt")
+
+                        if self.session_logger:
+                            self.session_logger.write_event("PERMISSION", f"{pattern_str} | {context}")
+
+                        self.do_approval(pty)
+
+                    else:
+                        # 2. Check model pause patterns (Claude asking pointless yes/no)
+                        found_pause = None
+                        for p in MODEL_PAUSE_PATTERNS:
+                            if p in clean_chunk:
+                                found_pause = p
+                                break
+
+                        if found_pause and (time.time() - self._last_auto_answer_time > 10):
+                            pattern_str = found_pause.decode('utf-8', errors='replace')
+                            log(f"MODEL PAUSE MATCHED: {found_pause!r}")
+                            context = self.context_buffer[-300:].strip()
+
+                            if self.friction_logger:
+                                self.friction_logger.record_prompt(pattern_str, context, "model_pause")
+
+                            if self.session_logger:
+                                self.session_logger.write_event("MODEL PAUSE", f"{pattern_str}")
+
+                            # Auto-answer: select first option
+                            self._auto_answer(pty)
+
+                        elif b'Esc to cancel' in clean_chunk:
+                            log(f"DEBUG: Found 'Esc to cancel' but no match in clean chunk: {clean_chunk[-256:]!r}")
+
+                self.overlap_buffer = raw_bytes[-256:]
+            except Exception as e:
+                log(f"PTY Reader Error: {e}")
+                break
+
+    def do_approval(self, pty):
+        log("Executing auto-approval...")
+        self.in_approval = True
+        self.overlap_buffer = b""
+        time.sleep(0.1)
+        pty.write('\r')
+        log("Sent CR to PTY")
+        time.sleep(0.1)
+        self.in_approval = False
+
+    def _auto_answer(self, pty):
+        """Auto-answer model pause questions by selecting option 1 (yes/proceed).
+
+        Claude's AskUserQuestion renders numbered options like:
+          1. Yes (Recommended)
+          2. No
+        Sending '1\r' selects the first option. For plain text questions
+        that just need Enter, CR alone works too.
+        """
+        log("Auto-answering model pause...")
+        self._last_auto_answer_time = time.time()
+        self.in_approval = True
+        self.overlap_buffer = b""
+        time.sleep(0.2)  # slightly longer than permission — let the UI render
+        pty.write('1\r')
+        log("Sent '1\\r' to PTY")
+        time.sleep(0.1)
+        self.in_approval = False
+
+    def run(self):
+        sys.stderr.write(f"[Unleashed v{VERSION}] Starting...\n")
+        sys.stderr.flush()
+
+        # v20: set up raw transcript before anything else
+        self._setup_transcript()
+
+        # Read terminal size BEFORE changing console mode to avoid
+        # race condition where shutil.get_terminal_size() returns
+        # incorrect dimensions after mode change, causing Ink to
+        # render the status bar character-per-line at startup.
+        try:
+            term_size = shutil.get_terminal_size((120, 40))
+            cols, rows = term_size.columns, term_size.lines
+        except:
+            cols, rows = 120, 40
+
+        self._setup_console()
+
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        env["UNLEASHED_VERSION"] = VERSION
+
+        try:
+            claude_cmd = ['cmd', '/c', CLAUDE_CMD] + self.claude_args
+            log(f"Spawning: {claude_cmd}")
+            pty = winpty.PtyProcess.spawn(claude_cmd, dimensions=(rows, cols), cwd=self.cwd, env=env)
+        except Exception as e:
+            sys.stderr.write(f"[v{VERSION}] Spawn FAILED: {e}\n")
+            log(f"Spawn FAILED: {e}")
+            self._restore_console()
+            self._close_transcript()
+            return
+
+        # v18: Initialize loggers and launch companion tabs
+        session_ts = time.strftime("%Y%m%d-%H%M%S")
+        session_id = f"unleashed-{session_ts}"
+
+        if self.mirror:
+            self.session_logger = SessionLogger(session_ts, self.joint_log)
+            log(f"Session mirror: {self.session_logger.path}")
+
+        if self.friction:
+            self.friction_logger = FrictionLogger(session_ts, session_id)
+            log(f"Friction logger: {self.friction_logger.human_path}")
+
+        # Launch tabs AFTER creating log files so tail -f has a file to open
+        if self.mirror:
+            launch_tab("Session Mirror", self.session_logger.path)
+
+        if self.friction:
+            launch_tab("Friction", self.friction_logger.human_path)
+
+        t1 = threading.Thread(target=self._reader_stdin, args=(pty,), daemon=True)
+        t2 = threading.Thread(target=self._reader_pty, args=(pty,), daemon=True)
+        t3 = threading.Thread(target=self._resize_monitor, args=(pty,), daemon=True)
+        t1.start()
+        t2.start()
+        t3.start()
+
+        try:
+            while self.running and pty.isalive():
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.running = False
+            time.sleep(0.2)
+
+            # Close loggers and transcript before PTY termination
+            self._close_transcript()
+            if self.session_logger:
+                self.session_logger.close()
+            if self.friction_logger:
+                self.friction_logger.close()
+
+            pty.terminate()
+            self._restore_console()
+            sys.stdout.write(TERM_RESET)
+            sys.stdout.write('\x1bc')
+            sys.stdout.flush()
+            log("Shutting down")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=f"Unleashed v{VERSION} — Triplet Tabs")
+    parser.add_argument("--cwd", default=None, help="Working directory for Claude Code")
+    parser.add_argument("--mirror", action="store_true", default=True, help="Open session mirror tab (default: on)")
+    parser.add_argument("--no-mirror", action="store_false", dest="mirror", help="Disable session mirror tab")
+    parser.add_argument("--friction", action="store_true", default=True, help="Open permission friction logger tab (default: on)")
+    parser.add_argument("--no-friction", action="store_false", dest="friction", help="Disable permission friction logger tab")
+    parser.add_argument("--joint-log", action="store_true", help="Include permissions inline in session mirror (implies --mirror)")
+
+    # parse_known_args: unleashed flags are consumed, everything else passes to claude.cmd
+    args, claude_args = parser.parse_known_args()
+
+    # --joint-log implies --mirror
+    if args.joint_log:
+        args.mirror = True
+
+    Unleashed(
+        cwd=args.cwd,
+        mirror=args.mirror,
+        friction=args.friction,
+        joint_log=args.joint_log,
+        claude_args=claude_args
+    ).run()
