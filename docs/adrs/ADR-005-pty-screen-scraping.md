@@ -30,10 +30,10 @@ The only observable output is the raw byte stream from the PTY (pseudo-terminal)
 Four patterns identify permission prompts:
 ```python
 PERMISSION_PATTERNS = [
-    b"Allow this action?",
-    b"Allow tool?",
-    b"Do you want to proceed?",
-    b"Press Enter to allow",
+    b'Tab to amend',
+    b'Do you want to proceed?',
+    b'Allow this command to run?',
+    b'Do you want to allow Claude to fetch this content?',
 ]
 ```
 
@@ -107,8 +107,8 @@ This isn't a "best option" decision — it's an "only viable option" decision. O
 
 Screen scraping is fragile by nature. The mitigation strategy is:
 1. **Multiple patterns:** 4 different prompt strings reduce the chance of total detection failure
-2. **Overlap buffer:** 32-byte overlap between read chunks prevents missing patterns split across reads
-3. **Context buffer:** 2KB of ANSI-stripped context for tool type extraction (acknowledged as too small — issue #43)
+2. **Overlap buffer:** 256-byte overlap between read chunks prevents missing patterns split across reads
+3. **Context buffer:** 2KB of ANSI-stripped context for tool type extraction (acknowledged as potentially too small — issue #43)
 4. **Sentinel as safety net:** Even if detection fails (false positive), sentinel evaluates the command before approval
 5. **Version monitoring:** GitHub Action (`release-watch.yml`) alerts when Claude Code releases a new version, enabling proactive pattern validation
 
@@ -153,8 +153,8 @@ The fundamental constraint is architectural: Claude Code is a closed-source term
 
 ### Detection Flow
 
-1. PTY reader receives raw bytes from `pty.read(4096)`
-2. Bytes are prepended with 32-byte overlap from previous read
+1. PTY reader receives raw bytes from `pty.read(8192)`
+2. Bytes are prepended with 256-byte overlap from previous read
 3. Search for any of 4 PERMISSION_PATTERNS in the combined chunk
 4. If matched: extract tool type/args from ANSI-stripped context buffer via `TOOL_CALL_RE`
 5. Pass to `do_approval()` → sentinel check or immediate approval
