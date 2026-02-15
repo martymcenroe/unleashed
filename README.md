@@ -80,17 +80,30 @@ Worker threads handle sentinel API calls without blocking the PTY reader. See [A
 git clone https://github.com/martymcenroe/unleashed.git
 cd unleashed && poetry install
 
-# 2. Add shell functions to ~/.bash_profile
+# 2. Add the tier system to ~/.bash_profile
+_unleashed_run() {
+  local script="$1"; shift
+  local project_path
+  project_path="$(cygpath -w "$(pwd)")"
+  (cd /c/Users/mcwiz/Projects/unleashed && \
+   poetry run python "src/$script" --cwd "$project_path" "$@")
+}
+
 unleashed() {
-  (PROJECT_PATH="$(cygpath -w "$(pwd)")" && \
-   cd /path/to/unleashed && \
-   poetry run python src/unleashed-c-18.py --cwd "$PROJECT_PATH" "$@")
+  _unleashed_run unleashed-c-21.py --sentinel-shadow --mirror --friction "$@"
 }
 
 # 3. Run from any project directory
 cd ~/Projects/my-project
 unleashed
+
+# 4. Optional: beta/alpha tiers for testing new versions
+unleashed-beta() {
+  _unleashed_run unleashed-c-22.py --mirror --friction "$@"  # example
+}
 ```
+
+See [Version Promotions](https://github.com/martymcenroe/unleashed/wiki/Version-Promotions) for the tier system and promotion workflow.
 
 ## Sentinel Safety Gate
 
@@ -133,7 +146,7 @@ See [Session Mirror wiki](https://github.com/martymcenroe/unleashed/wiki/Session
 
 ## Roadmap
 
-All 30 open issues are organized on the **[Unleashed Roadmap](https://github.com/users/martymcenroe/projects/6)** project board.
+All 45+ open issues are organized on the **[Unleashed Roadmap](https://github.com/users/martymcenroe/projects/6)** project board.
 
 | Priority | Focus | Key Issues |
 |----------|-------|------------|
@@ -156,6 +169,11 @@ See [Roadmap wiki](https://github.com/martymcenroe/unleashed/wiki/Roadmap) for t
 | [Session Mirror](https://github.com/martymcenroe/unleashed/wiki/Session-Mirror) | ANSI stripping, garbage filtering, dedup |
 | [Garbage Filter](https://github.com/martymcenroe/unleashed/wiki/Garbage-Filter) | 95-pattern engine, categories, maintenance |
 | [Security Model](https://github.com/martymcenroe/unleashed/wiki/Security-Model) | Threat model, trust boundaries, known vulns |
+| [Version History](https://github.com/martymcenroe/unleashed/wiki/Version-History) | Evolution from A01 to c-21, tier system |
+| [Version Promotions](https://github.com/martymcenroe/unleashed/wiki/Version-Promotions) | Prod/beta/alpha tiers, promotion log |
+| [Roadmap](https://github.com/martymcenroe/unleashed/wiki/Roadmap) | Priorities, GitHub Projects board |
+| [For Security Reviewers](https://github.com/martymcenroe/unleashed/wiki/For-Security-Reviewers) | Security review guide, audit checklist |
+| [For Contributors](https://github.com/martymcenroe/unleashed/wiki/For-Contributors) | Dev setup, code map, testing |
 | [Lessons Learned](https://github.com/martymcenroe/unleashed/wiki/Lessons-Learned) | 7 lessons from building unleashed |
 
 ### Architecture Decision Records
