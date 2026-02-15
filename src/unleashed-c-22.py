@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Unleashed - v00021
-- New: Shared garbage filter (transcript_filters.is_garbage) replaces 4-pattern NOISE_RE
-  in session mirror — same 95 patterns used by post-session clean_transcript.py
-- New: Rate-limited mirror writes (200ms buffer) — reduces mid-repaint garbage and letter drops
-- Carries forward all v20 features: transcript save, 0.1s approval timing,
-  mirror, friction, joint-log, resize, model pause
+Unleashed - v00022
+- Fix: Session mirror space elimination (#35) — \x1b[1C (CUF 1) is Ink's word
+  spacing mechanism (62K+ per session). Parser now inserts space for n>=1.
+- New: Short-line filter — lines <3 chars (CUP fragments) filtered from mirror
+- New: Spinner fragment filter — partial spinner renders <15 chars filtered
+- New: SPINNER_FRAG_RE regex for mid-repaint capture noise
+- Carries forward all v21 features: sentinel gate, shared garbage filter,
+  rate-limited mirror, transcript save, friction, joint-log, resize, model pause
 
-Based on v00020. Implements issue #29 (B+D+F).
+Based on v00021. Fixes issue #35.
 """
 import os
 import sys
@@ -27,7 +29,7 @@ from ctypes import wintypes
 # Shared garbage filter — single source of truth for TUI noise patterns
 from transcript_filters import is_garbage
 
-VERSION = "00021"
+VERSION = "00022"
 LOG_FILE = os.path.join("logs", f"unleashed_v{VERSION}.log")
 
 # winpty write buffer limit
@@ -108,6 +110,10 @@ ORPHAN_OSC_RE = re.compile(r'\]\d;.*')              # ]0;window title... (eats w
 MIRROR_CONTROL_RE = re.compile(rb'[\x00-\x09\x0b-\x1f\x7f]')
 
 SPINNER_PREFIX_RE = re.compile(r'^[*✶✻✽·✢●]\s*')
+# Spinner fragment: spinner char + partial status text from mid-repaint capture.
+# Real spinner lines are 20+ chars ("● Running under unleashed v00021.").
+# Fragments are <15 chars ("✻ Me", "✽ M a", "✶ or").
+SPINNER_FRAG_RE = re.compile(r'^[*✶✻✽·✢●]\s*.{0,12}$')
 SEPARATOR_RE = re.compile(r'^[\s─━═╌╍┄┅]{8,}$')  # mostly box-drawing (allows spaces)
 TIMESTAMP_FRAG_RE = re.compile(r'\d{0,2}:\d{2}[:\])]')  # leaked timestamp fragments
 
@@ -188,9 +194,11 @@ def mirror_strip_ansi(data: bytes) -> bytes:
                         col = new_col
 
                     # Cursor Forward: \x1b[nC
+                    # Ink uses \x1b[1C as the space between words — 62K+ per session.
+                    # Any forward cursor movement represents a gap → insert space.
                     elif final == 0x43:  # C
                         n = int(param_bytes) if param_bytes else 1
-                        if n > 1:
+                        if n >= 1:
                             result.append(b' ')
                         col += n
 
@@ -732,6 +740,15 @@ class Unleashed:
                 stripped = ORPHAN_OSC_RE.sub('', stripped)
                 stripped = stripped.strip()
                 if not stripped:
+                    continue
+
+                # Short-line filter: 1-2 char lines are TUI rendering fragments
+                # (char-by-char CUP positioning, spinner partials, path chars)
+                if len(stripped) < 3:
+                    continue
+
+                # Spinner fragment filter: mid-repaint captures of spinner + partial text
+                if SPINNER_FRAG_RE.match(stripped):
                     continue
 
                 # v21: Shared garbage filter — 95 patterns, single source of truth

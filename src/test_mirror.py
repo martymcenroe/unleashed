@@ -25,10 +25,12 @@ from pathlib import Path
 # Import is_garbage from transcript_filters (clean import)
 from transcript_filters import is_garbage
 
-# Import mirror_strip_ansi from unleashed-c-21.py (hyphenated filename)
+# Import mirror_strip_ansi from the latest version (hyphenated filename)
+# Update this when promoting a new version.
+_UNLEASHED_SRC = "unleashed-c-22.py"
 _spec = importlib.util.spec_from_file_location(
-    "unleashed_c21",
-    os.path.join(os.path.dirname(__file__), "unleashed-c-21.py")
+    "unleashed_mod",
+    os.path.join(os.path.dirname(__file__), _UNLEASHED_SRC)
 )
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
