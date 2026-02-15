@@ -108,6 +108,10 @@ ORPHAN_OSC_RE = re.compile(r'\]\d;.*')              # ]0;window title... (eats w
 MIRROR_CONTROL_RE = re.compile(rb'[\x00-\x09\x0b-\x1f\x7f]')
 
 SPINNER_PREFIX_RE = re.compile(r'^[*✶✻✽·✢●]\s*')
+# Spinner fragment: spinner char + partial status text from mid-repaint capture.
+# Real spinner lines are 20+ chars ("● Running under unleashed v00021.").
+# Fragments are <15 chars ("✻ Me", "✽ M a", "✶ or").
+SPINNER_FRAG_RE = re.compile(r'^[*✶✻✽·✢●]\s*.{0,12}$')
 SEPARATOR_RE = re.compile(r'^[\s─━═╌╍┄┅]{8,}$')  # mostly box-drawing (allows spaces)
 TIMESTAMP_FRAG_RE = re.compile(r'\d{0,2}:\d{2}[:\])]')  # leaked timestamp fragments
 
@@ -188,9 +192,11 @@ def mirror_strip_ansi(data: bytes) -> bytes:
                         col = new_col
 
                     # Cursor Forward: \x1b[nC
+                    # Ink uses \x1b[1C as the space between words — 62K+ per session.
+                    # Any forward cursor movement represents a gap → insert space.
                     elif final == 0x43:  # C
                         n = int(param_bytes) if param_bytes else 1
-                        if n > 1:
+                        if n >= 1:
                             result.append(b' ')
                         col += n
 
@@ -732,6 +738,15 @@ class Unleashed:
                 stripped = ORPHAN_OSC_RE.sub('', stripped)
                 stripped = stripped.strip()
                 if not stripped:
+                    continue
+
+                # Short-line filter: 1-2 char lines are TUI rendering fragments
+                # (char-by-char CUP positioning, spinner partials, path chars)
+                if len(stripped) < 3:
+                    continue
+
+                # Spinner fragment filter: mid-repaint captures of spinner + partial text
+                if SPINNER_FRAG_RE.match(stripped):
                     continue
 
                 # v21: Shared garbage filter — 95 patterns, single source of truth

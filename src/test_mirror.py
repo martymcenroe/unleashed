@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+Mirror Pipeline Test Harness — replay .raw transcripts through the mirror pipeline.
+
+Reads a .raw PTY transcript file, processes it through the exact same pipeline
+as the live session mirror in unleashed-c-21.py, and writes clean output.
+
+This enables deterministic, repeatable testing: change mirror_strip_ansi() or
+transcript_filters.py, re-run on the same .raw file, diff the output.
+
+Usage:
+    poetry run python src/test_mirror.py <raw_file> [output_file]
+    poetry run python src/test_mirror.py <raw_file> --stats    # show garbage stats
+    poetry run python src/test_mirror.py <raw_file> --debug    # show what gets filtered
+
+If output_file is omitted, writes to stdout.
+"""
+import sys
+import os
+import re
+import importlib.util
+from collections import deque
+from pathlib import Path
+
+# Import is_garbage from transcript_filters (clean import)
+from transcript_filters import is_garbage
+
+# Import mirror_strip_ansi from unleashed-c-21.py (hyphenated filename)
+_spec = importlib.util.spec_from_file_location(
+    "unleashed_c21",
+    os.path.join(os.path.dirname(__file__), "unleashed-c-21.py")
+)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+mirror_strip_ansi = _mod.mirror_strip_ansi
+ORPHAN_CSI_RE = _mod.ORPHAN_CSI_RE
+ORPHAN_OSC_RE = _mod.ORPHAN_OSC_RE
+SPINNER_PREFIX_RE = _mod.SPINNER_PREFIX_RE
+SPINNER_FRAG_RE = _mod.SPINNER_FRAG_RE
+MIRROR_FLUSH_INTERVAL = _mod.MIRROR_FLUSH_INTERVAL
+
+# Chunk size matching pty.read() in the live system
+PTY_READ_SIZE = 8192
+
+# Dedup window matching the live system
+DEDUP_WINDOW = 32
+
+
+def replay_mirror(raw_path: str, *, debug: bool = False, stats: bool = False) -> list[str]:
+    """Replay a .raw transcript through the mirror pipeline.
+
+    Returns list of clean output lines.
+    """
+    with open(raw_path, "rb") as f:
+        raw_data = f.read()
+
+    # Simulate the rate-limited buffer by processing in chunks.
+    # In the live system, chunks accumulate for 200ms before flushing.
+    # Here we simulate by grouping PTY_READ_SIZE chunks into flush batches.
+    # A 200ms batch at typical throughput is roughly 4-8 chunks.
+    CHUNKS_PER_FLUSH = 6  # ~200ms worth at typical throughput
+
+    output_lines = []
+    recent = deque(maxlen=DEDUP_WINDOW)
+
+    # Stats tracking
+    total_lines = 0
+    garbage_lines = 0
+    orphan_lines = 0
+    dedup_lines = 0
+    empty_lines = 0
+    debug_log = []
+
+    # Process in chunks, accumulating into flush batches
+    offset = 0
+    flush_buffer = b""
+
+    while offset < len(raw_data):
+        # Accumulate CHUNKS_PER_FLUSH chunks into one flush buffer
+        for _ in range(CHUNKS_PER_FLUSH):
+            end = min(offset + PTY_READ_SIZE, len(raw_data))
+            flush_buffer += raw_data[offset:end]
+            offset = end
+            if offset >= len(raw_data):
+                break
+
+        if not flush_buffer:
+            break
+
+        # Stage 1: ANSI strip via cursor-tracking parser
+        clean = mirror_strip_ansi(flush_buffer)
+        text = clean.decode("utf-8", errors="replace")
+
+        # Stage 2-5: Line-by-line processing
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                empty_lines += 1
+                continue
+
+            total_lines += 1
+
+            # Stage 2: Strip orphaned escape sequence payloads
+            before_orphan = stripped
+            stripped = ORPHAN_CSI_RE.sub("", stripped)
+            stripped = ORPHAN_OSC_RE.sub("", stripped)
+            stripped = stripped.strip()
+            if not stripped:
+                orphan_lines += 1
+                if debug:
+                    debug_log.append(f"[ORPHAN] {before_orphan[:80]}")
+                continue
+
+            # Stage 3a: Short-line filter (TUI rendering fragments)
+            if len(stripped) < 3:
+                garbage_lines += 1
+                if debug:
+                    debug_log.append(f"[SHORT] {stripped[:80]}")
+                continue
+
+            # Stage 3b: Spinner fragment filter
+            if SPINNER_FRAG_RE.match(stripped):
+                garbage_lines += 1
+                if debug:
+                    debug_log.append(f"[SPINNER] {stripped[:80]}")
+                continue
+
+            # Stage 3c: Garbage filter
+            if is_garbage(stripped):
+                garbage_lines += 1
+                if debug:
+                    debug_log.append(f"[GARBAGE] {stripped[:80]}")
+                continue
+
+            # Stage 4: Dedup
+            normalized = SPINNER_PREFIX_RE.sub("", stripped).strip()
+            if normalized in recent:
+                dedup_lines += 1
+                if debug:
+                    debug_log.append(f"[DEDUP] {stripped[:80]}")
+                continue
+
+            recent.append(normalized)
+            output_lines.append(stripped)
+
+        flush_buffer = b""
+
+    if stats or debug:
+        summary = [
+            "",
+            "=" * 60,
+            "  Mirror Pipeline Statistics",
+            "=" * 60,
+            f"  Raw file size:     {len(raw_data):,} bytes",
+            f"  Total lines:       {total_lines:,}",
+            f"  Empty lines:       {empty_lines:,}",
+            f"  Garbage filtered:  {garbage_lines:,} ({garbage_lines*100//max(total_lines,1)}%)",
+            f"  Orphan stripped:   {orphan_lines:,}",
+            f"  Deduped:           {dedup_lines:,}",
+            f"  Output lines:      {len(output_lines):,} ({len(output_lines)*100//max(total_lines,1)}% pass rate)",
+            "=" * 60,
+        ]
+        for s in summary:
+            print(s, file=sys.stderr)
+
+    if debug:
+        print("\n--- Debug: First 100 filtered lines ---", file=sys.stderr)
+        for entry in debug_log[:100]:
+            print(f"  {entry}", file=sys.stderr)
+
+    return output_lines
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+
+    raw_path = sys.argv[1]
+    if not os.path.exists(raw_path):
+        print(f"Error: {raw_path} not found", file=sys.stderr)
+        sys.exit(1)
+
+    debug = "--debug" in sys.argv
+    stats_only = "--stats" in sys.argv
+
+    # Find output path (first arg that isn't a flag)
+    output_path = None
+    for arg in sys.argv[2:]:
+        if not arg.startswith("--"):
+            output_path = arg
+            break
+
+    lines = replay_mirror(raw_path, debug=debug, stats=(stats_only or debug))
+
+    if stats_only:
+        # Just show stats, don't write output
+        print(f"\nSample output (first 20 lines):", file=sys.stderr)
+        for line in lines[:20]:
+            print(f"  {line}", file=sys.stderr)
+        sys.exit(0)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            for line in lines:
+                f.write(line + "\n")
+        print(f"Wrote {len(lines)} lines to {output_path}", file=sys.stderr)
+    else:
+        for line in lines:
+            print(line)
+
+
+if __name__ == "__main__":
+    main()
