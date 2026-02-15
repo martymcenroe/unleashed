@@ -133,7 +133,8 @@ GARBAGE_PATTERNS = [
     re.compile(r'^[\s*·✶✻✽✢]*\s*Worked for \d+'),
 
     # 23. Agent tree lines (├─, │ ⎿, └─) with initializing/tool counts
-    re.compile(r'^[├│└─]+\s'),
+    # Excludes table content rows (│ text │ text │) which have 2+ │ with text between
+    re.compile(r'^[├│└─]+\s(?!.*\w+.*│)'),
 
     # 24. Done summary: "⎿ Done(8tooluses·54.8ktokens·22s)"
     re.compile(r'^⎿\s*Done\s*\('),
