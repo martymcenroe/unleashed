@@ -12,6 +12,7 @@ Based on v00022.
 """
 import os
 import sys
+import atexit
 import threading
 import time
 import argparse
@@ -682,7 +683,9 @@ class Unleashed:
                     if char and ord(char) > 0: output_chars.append(char)
                 if output_chars:
                     self._pty_write_chunked(pty, ''.join(output_chars))
-            except: break
+            except Exception as e:
+                log(f"Stdin reader error: {e}")
+                break
 
     def _resize_monitor(self, pty):
         """Poll for terminal resize and forward new dimensions to PTY."""
@@ -1074,6 +1077,9 @@ class Unleashed:
             cols, rows = 120, 40
 
         self._setup_console()
+
+        # Ensure console is restored even on unhandled crash
+        atexit.register(self._restore_console)
 
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"

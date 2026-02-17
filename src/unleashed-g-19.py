@@ -15,6 +15,7 @@ v19 changes:
 """
 import os
 import sys
+import atexit
 import subprocess
 import threading
 import time
@@ -355,7 +356,8 @@ class UnleashedG:
                 if output_chars:
                     self._pty_write_chunked(pty, ''.join(output_chars))
 
-            except Exception:
+            except Exception as e:
+                log(f"Stdin reader error: {e}")
                 break
 
     def _reader_pty(self, pty):
@@ -385,7 +387,8 @@ class UnleashedG:
 
                     # Keep enough overlap for the pattern
                     self.overlap_buffer = raw_bytes[-64:]
-            except Exception:
+            except Exception as e:
+                log(f"PTY reader error: {e}")
                 break
 
     def do_approval(self, pty):
@@ -420,6 +423,9 @@ class UnleashedG:
             cols, rows = 120, 40
 
         self._setup_console()
+
+        # Ensure console is restored even on unhandled crash
+        atexit.register(self._restore_console)
 
         # Set up raw session log (tee of PTY output)
         os.makedirs("logs", exist_ok=True)
