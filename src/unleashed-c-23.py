@@ -565,6 +565,8 @@ class Unleashed:
         self.context_buffer = ""         # last 2048 chars of stripped PTY text
         self._mirror_recent = deque(maxlen=32)  # recent lines for mirror dedup
         self._last_auto_answer_time = 0  # cooldown: prevent _auto_answer loop
+        self.approval_count = 0          # #46: total auto-approvals this session
+        self.session_start = None        # #46: set in run()
         # v20: raw transcript save
         self.transcript_file = None
         # v21: rate-limited mirror writes
@@ -578,6 +580,27 @@ class Unleashed:
         self.sentinel_gate = None
         self._shadow_fh = None
         log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, sentinel_shadow={sentinel_shadow}, sentinel_scope={sentinel_scope}, claude_args={self.claude_args})")
+
+    def _purge_old_logs(self, max_age_days: int = 7):
+        """Delete session logs older than max_age_days from logs/ directory."""
+        log_dir = Path("logs")
+        if not log_dir.exists():
+            return
+        cutoff = time.time() - (max_age_days * 86400)
+        extensions = {'.log', '.raw', '.jsonl'}
+        cleaned = 0
+        for f in log_dir.iterdir():
+            if f.suffix in extensions and f.is_file():
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        cleaned += 1
+                except Exception:
+                    pass
+        if cleaned:
+            log(f"Log cleanup: deleted {cleaned} files older than {max_age_days}d from logs/")
+            sys.stderr.write(f"[v{VERSION}] Cleaned {cleaned} old log files\n")
+            sys.stderr.flush()
 
     def _setup_transcript(self):
         """Set up raw transcript file in the target project's data/unleashed/ dir."""
@@ -985,6 +1008,7 @@ class Unleashed:
                 return  # PTY reader resumes; in_approval stays True until sentinel thread finishes
 
         # Default: instant approval
+        self.approval_count += 1
         log("Executing auto-approval...")
         time.sleep(0.1)
         pty.write('\r')
@@ -1050,6 +1074,7 @@ class Unleashed:
         that just need Enter, CR alone works too.
         """
         log("Auto-answering model pause...")
+        self.approval_count += 1
         self._last_auto_answer_time = time.time()
         self.in_approval = True
         self.overlap_buffer = b""
@@ -1060,8 +1085,12 @@ class Unleashed:
         self.in_approval = False
 
     def run(self):
+        self.session_start = time.time()
         sys.stderr.write(f"[Unleashed v{VERSION}] Starting...\n")
         sys.stderr.flush()
+
+        # #23: purge old session logs on startup
+        self._purge_old_logs()
 
         # v20: set up raw transcript before anything else
         self._setup_transcript()
@@ -1164,11 +1193,6 @@ class Unleashed:
             self._close_transcript()
             if self._shadow_fh:
                 self._shadow_fh.close()
-            if self.sentinel_gate:
-                stats = self.sentinel_gate.stats
-                log(f"Sentinel stats: {stats}")
-                sys.stderr.write(f"[v{VERSION}] Sentinel stats: {stats}\n")
-                sys.stderr.flush()
             if self.session_logger:
                 self.session_logger.close()
             if self.friction_logger:
@@ -1179,7 +1203,27 @@ class Unleashed:
             sys.stdout.write(TERM_RESET)
             sys.stdout.write('\x1bc')
             sys.stdout.flush()
-            log("Shutting down")
+
+            # #46: Print session summary to stderr
+            elapsed = time.time() - self.session_start if self.session_start else 0
+            mins, secs = divmod(int(elapsed), 60)
+            hrs, mins = divmod(mins, 60)
+            dur = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+            sys.stderr.write(f"\n\u2500\u2500 unleashed v{VERSION} session summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+            sys.stderr.write(f"  Duration:     {dur}\n")
+            sys.stderr.write(f"  Approvals:    {self.approval_count}\n")
+            if self.sentinel_gate:
+                s = self.sentinel_gate.stats
+                sys.stderr.write(f"  Sentinel:     {s.get('local_allow', 0)} local-allow, "
+                                 f"{s.get('api_allow', 0)} api-allow, "
+                                 f"{s.get('local_block', 0) + s.get('api_block', 0)} blocked\n")
+            if self.session_logger:
+                sys.stderr.write(f"  Mirror:       {self.session_logger.path}\n")
+            if self.friction_logger:
+                sys.stderr.write(f"  Friction:     {self.friction_logger.jsonl_path}\n")
+            sys.stderr.write(f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+            sys.stderr.flush()
+            log(f"Session summary: {dur}, {self.approval_count} approvals")
             sys.exit(0)
 
 if __name__ == "__main__":

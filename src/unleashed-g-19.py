@@ -231,6 +231,8 @@ class UnleashedG:
         self.friction = friction
         self.session_fh = None  # raw tee file handle
         self.friction_logger = None
+        self.approval_count = 0          # #46: total auto-approvals this session
+        self.session_start = None        # #46: set in run()
 
     def _setup_console(self):
         """Set up console for raw input - minimal mode changes"""
@@ -400,6 +402,7 @@ class UnleashedG:
         """
         self.in_approval = True
         self.overlap_buffer = b""
+        self.approval_count += 1
         time.sleep(0.2)  # v19: was 0.1 — longer delay lets UI settle
         pty.write('\r')
         log("Auto-approved (sent CR)")
@@ -408,11 +411,37 @@ class UnleashedG:
         time.sleep(0.1)
         self.in_approval = False
 
+    def _purge_old_logs(self, max_age_days: int = 7):
+        """Delete session logs older than max_age_days from logs/ directory."""
+        from pathlib import Path
+        log_dir = Path("logs")
+        if not log_dir.exists():
+            return
+        cutoff = time.time() - (max_age_days * 86400)
+        extensions = {'.log', '.raw', '.jsonl'}
+        cleaned = 0
+        for f in log_dir.iterdir():
+            if f.suffix in extensions and f.is_file():
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        cleaned += 1
+                except Exception:
+                    pass
+        if cleaned:
+            log(f"Log cleanup: deleted {cleaned} files older than {max_age_days}d from logs/")
+            sys.stderr.write(f"[v{VERSION}] Cleaned {cleaned} old log files\n")
+            sys.stderr.flush()
+
     def run(self):
+        self.session_start = time.time()
         session_ts = time.strftime("%Y%m%d-%H%M%S")
 
         sys.stderr.write(f"[Unleashed-G v{VERSION}] Starting...\n")
         sys.stderr.flush()
+
+        # #23: purge old session logs on startup
+        self._purge_old_logs()
 
         # Read terminal size BEFORE changing console mode
         try:
@@ -486,7 +515,22 @@ class UnleashedG:
             sys.stdout.write(TERM_RESET)
             sys.stdout.write('\x1bc')
             sys.stdout.flush()
-            log("Shutting down")
+
+            # #46: Print session summary to stderr
+            elapsed = time.time() - self.session_start if self.session_start else 0
+            mins, secs = divmod(int(elapsed), 60)
+            hrs, mins = divmod(mins, 60)
+            dur = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
+            sys.stderr.write(f"\n\u2500\u2500 unleashed-G v{VERSION} session summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+            sys.stderr.write(f"  Duration:     {dur}\n")
+            sys.stderr.write(f"  Approvals:    {self.approval_count}\n")
+            if session_log_path:
+                sys.stderr.write(f"  Session log:  {session_log_path}\n")
+            if self.friction_logger:
+                sys.stderr.write(f"  Friction:     {self.friction_logger.jsonl_path}\n")
+            sys.stderr.write(f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+            sys.stderr.flush()
+            log(f"Session summary: {dur}, {self.approval_count} approvals")
             sys.exit(0)
 
 if __name__ == "__main__":
