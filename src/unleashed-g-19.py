@@ -89,9 +89,14 @@ class INPUT_RECORD(ctypes.Structure):
 # Gemini CLI path
 GEMINI_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\gemini.cmd"
 
-# Gemini permission prompt pattern
-# Gemini shows: "⠦ Waiting for user confirmation ..." (spinner varies)
-FOOTER_PATTERN = b'Waiting for user confirmation'
+# Gemini permission prompt patterns
+# Gemini shows different prompts depending on the tool:
+#   - Shell commands: "⠦ Waiting for user confirmation ..." (spinner varies)
+#   - File writes:    "Apply this change?" with numbered options
+PERMISSION_PATTERNS = [
+    b'Waiting for user confirmation',
+    b'Apply this change?',
+]
 
 # Virtual key codes to ANSI escape sequences
 VK_MAP = {
@@ -384,8 +389,12 @@ class UnleashedG:
 
                     # Use overlap buffer to catch pattern split across reads
                     search_chunk = self.overlap_buffer + raw_bytes
-                    if not self.in_approval and FOOTER_PATTERN in search_chunk:
-                        self.do_approval(pty)
+                    if not self.in_approval:
+                        for pattern in PERMISSION_PATTERNS:
+                            if pattern in search_chunk:
+                                log(f"Pattern matched: {pattern!r}")
+                                self.do_approval(pty)
+                                break
 
                     # Keep enough overlap for the pattern
                     self.overlap_buffer = raw_bytes[-64:]
