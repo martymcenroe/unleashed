@@ -93,9 +93,11 @@ GEMINI_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\gemini.cmd"
 # Gemini shows different prompts depending on the tool:
 #   - Shell commands: "⠦ Waiting for user confirmation ..." (spinner varies)
 #   - File writes:    "Apply this change?" with numbered options
+#   - Tool approval:  "Action Required" → "Allow execution of: 'tool'?"
 PERMISSION_PATTERNS = [
     b'Waiting for user confirmation',
     b'Apply this change?',
+    b'Allow execution of:',
 ]
 
 # Virtual key codes to ANSI escape sequences
@@ -169,7 +171,7 @@ class FrictionLogger:
         self.fh_human.write("Waiting for permission prompts...\n\n")
         self.fh_human.flush()
 
-    def record_prompt(self):
+    def record_prompt(self, pattern="unknown"):
         self.prompt_count += 1
         now = time.time()
         elapsed = int(now - self.session_start)
@@ -179,7 +181,7 @@ class FrictionLogger:
             "ts": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
             "elapsed_s": elapsed,
             "type": "permission_prompt",
-            "pattern": "Waiting for user confirmation",
+            "pattern": pattern,
             "auto_approved": True,
             "prompt_number": self.prompt_count
         }
@@ -393,7 +395,7 @@ class UnleashedG:
                         for pattern in PERMISSION_PATTERNS:
                             if pattern in search_chunk:
                                 log(f"Pattern matched: {pattern!r}")
-                                self.do_approval(pty)
+                                self.do_approval(pty, pattern.decode('utf-8', errors='replace'))
                                 break
 
                     # Keep enough overlap for the pattern
@@ -402,7 +404,7 @@ class UnleashedG:
                 log(f"PTY reader error: {e}")
                 break
 
-    def do_approval(self, pty):
+    def do_approval(self, pty, pattern="unknown"):
         """Auto-approve by sending Enter (accepts default/focused option).
 
         v18: send just CR instead of '1\\r' to avoid echo.
@@ -414,9 +416,9 @@ class UnleashedG:
         self.approval_count += 1
         time.sleep(0.2)  # v19: was 0.1 — longer delay lets UI settle
         pty.write('\r')
-        log("Auto-approved (sent CR)")
+        log(f"Auto-approved (sent CR) pattern={pattern!r}")
         if self.friction_logger:
-            self.friction_logger.record_prompt()
+            self.friction_logger.record_prompt(pattern=pattern)
         time.sleep(0.1)
         self.in_approval = False
 
