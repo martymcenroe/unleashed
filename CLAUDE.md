@@ -6,6 +6,7 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 
 - `src/unleashed-c-18.py` — Claude production (PTY wrapper with auto-approval)
 - `src/unleashed-c-23.py` — Claude latest (mirror noise filters + typeahead prompt collapsing)
+- `src/unleashed-c-24.py` — Claude beta (auto-tab-naming)
 - `src/unleashed-g-19.py` — Gemini production (triplet + 3 permission patterns)
 - `src/sentinel.py` — Standalone security gatekeeper (CLI)
 - `src/sentinel_gate.py` — Sentinel gate class (Haiku API, worker thread)
