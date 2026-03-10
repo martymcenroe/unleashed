@@ -41,7 +41,7 @@ SESSION_MIRROR_KEEP_LINES = 7_000
 try:
     import winpty
 except ImportError:
-    sys.stderr.write(f"[v{VERSION}] FATAL: pywinpty missing.\n")
+    sys.stderr.write(f"[Unleashed-T {VERSION}] FATAL: pywinpty missing.\n")
     sys.stderr.flush()
     sys.exit(1)
 
@@ -252,7 +252,7 @@ class SessionLogger:
         self.fh.write(f"{'=' * 60}\n")
         self.fh.write(f"  Unleashed-T v{VERSION} Session Mirror\n")
         self.fh.write(f"  Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.fh.write("  Mode: codex --full-auto\n")
+        self.fh.write("  Mode: codex -a never -s workspace-write\n")
         self.fh.write(f"{'=' * 60}\n\n")
         self.fh.flush()
         self.line_count = 6
@@ -306,7 +306,7 @@ class FrictionLogger:
         self.fh_human.write(f"{'=' * 60}\n")
         self.fh_human.write("  Codex Friction Logger\n")
         self.fh_human.write(f"  Started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        self.fh_human.write("  Mode: --full-auto (approval detection deferred to v02)\n")
+        self.fh_human.write("  Mode: -a never -s workspace-write (approval detection deferred to v02)\n")
         self.fh_human.write(f"{'=' * 60}\n\n")
         self.fh_human.write("No approval prompts are expected in v01.\n\n")
         self.fh_human.flush()
@@ -314,7 +314,7 @@ class FrictionLogger:
         self.fh_jsonl.write(json.dumps({
             "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
             "type": "session_config",
-            "mode": "full-auto",
+            "mode": "never/workspace-write",
             "approval_detection": "deferred",
         }) + "\n")
         self.fh_jsonl.flush()
@@ -374,7 +374,7 @@ class UnleashedT:
                     pass
         if cleaned:
             log(f"Log cleanup: deleted {cleaned} files older than {max_age_days}d from logs/")
-            sys.stderr.write(f"[v{VERSION}] Cleaned {cleaned} old log files\n")
+            sys.stderr.write(f"[Unleashed-T {VERSION}] Cleaned {cleaned} old log files\n")
             sys.stderr.flush()
 
     def _setup_console(self):
@@ -621,7 +621,7 @@ class UnleashedT:
         self.session_start = time.time()
         session_ts = time.strftime("%Y%m%d-%H%M%S")
 
-        sys.stderr.write(f"[Unleashed-T v{VERSION}] Starting...\n")
+        sys.stderr.write(f"[Unleashed-T {VERSION}] Starting...\n")
         sys.stderr.flush()
 
         self._purge_old_logs()
@@ -654,7 +654,7 @@ class UnleashedT:
         env["TERM"] = "xterm-256color"
         env["UNLEASHED_VERSION"] = VERSION
 
-        codex_cmd = ["cmd", "/c", CODEX_CMD, "--full-auto"] + self.codex_args
+        codex_cmd = ["cmd", "/c", CODEX_CMD, "-a", "never", "-s", "workspace-write"] + self.codex_args
         log(f"Spawning: {codex_cmd}")
 
         try:
@@ -665,7 +665,7 @@ class UnleashedT:
                 env=env,
             )
         except Exception as e:
-            sys.stderr.write(f"[v{VERSION}] Spawn FAILED: {e}\n")
+            sys.stderr.write(f"[Unleashed-T {VERSION}] Spawn FAILED: {e}\n")
             sys.stderr.flush()
             log(f"Spawn FAILED: {e}")
             self._restore_console()
@@ -708,9 +708,10 @@ class UnleashedT:
             mins, secs = divmod(int(elapsed), 60)
             hrs, mins = divmod(mins, 60)
             dur = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
-            sys.stderr.write(f"\n-- unleashed-T v{VERSION} session summary ------------------\n")
+            sys.stderr.write(f"\n-- unleashed-T {VERSION} session summary -------------------\n")
             sys.stderr.write(f"  Duration:     {dur}\n")
-            sys.stderr.write("  Approvals:    0 (--full-auto)\n")
+            sys.stderr.write("  Approvals:    never\n")
+            sys.stderr.write("  Sandbox:      workspace-write (requested)\n")
             sys.stderr.write(f"  Session log:  {session_log_path}\n")
             if self.session_logger:
                 sys.stderr.write(f"  Mirror:       {self.session_logger.path}\n")
@@ -718,7 +719,7 @@ class UnleashedT:
                 sys.stderr.write(f"  Friction:     {self.friction_logger.jsonl_path}\n")
             sys.stderr.write("----------------------------------------------------------\n")
             sys.stderr.flush()
-            log(f"Session summary: {dur}, full-auto mode")
+            log(f"Session summary: {dur}, approval=never sandbox=workspace-write")
 
 
 if __name__ == "__main__":
