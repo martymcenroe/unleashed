@@ -94,7 +94,7 @@ class INPUT_RECORD(ctypes.Structure):
         ("Event", INPUT_RECORD_UNION),
     ]
 
-CLAUDE_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\claude.cmd"
+CLAUDE_CMD = r"C:\Users\mcwiz\.local\bin\claude.exe"
 
 # Regex to strip ANSI escape sequences from raw bytes before pattern matching.
 ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b[A-Za-z]')
