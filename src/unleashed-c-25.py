@@ -96,6 +96,20 @@ class INPUT_RECORD(ctypes.Structure):
 
 CLAUDE_CMD = r"C:\Users\mcwiz\.local\bin\claude.exe"
 
+def _load_unleashed_config(cwd):
+    """Load .unleashed.json from cwd if present. Returns dict or None."""
+    config_path = os.path.join(cwd, '.unleashed.json')
+    if not os.path.isfile(config_path):
+        return None
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        log(f"Loaded .unleashed.json: profile={config.get('profile', '?')}")
+        return config
+    except (json.JSONDecodeError, OSError) as e:
+        log(f"WARNING: .unleashed.json malformed: {e}")
+        return None
+
 # Regex to strip ANSI escape sequences from raw bytes before pattern matching.
 ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]|\x1b[A-Za-z]')
 
@@ -605,6 +619,29 @@ class Unleashed:
         self._shadow_fh = None
         log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, sentinel_shadow={sentinel_shadow}, sentinel_scope={sentinel_scope}, claude_args={self.claude_args})")
 
+        # v25: Load .unleashed.json profile config
+        self._unleashed_config = _load_unleashed_config(self.cwd)
+        self.profile_name = None
+        if self._unleashed_config:
+            self.profile_name = self._unleashed_config.get("profile")
+            claude_cfg = self._unleashed_config.get("claude", {})
+            # Inject --model if configured and not already specified via CLI
+            if claude_cfg.get("model") and "--model" not in self.claude_args:
+                self.claude_args.extend(["--model", claude_cfg["model"]])
+                log(f"Profile injected --model {claude_cfg['model']}")
+            # Inject --effort if configured and not already specified via CLI
+            if claude_cfg.get("effort") and "--effort" not in self.claude_args:
+                self.claude_args.extend(["--effort", claude_cfg["effort"]])
+                log(f"Profile injected --effort {claude_cfg['effort']}")
+            # Print profile banner
+            banner_parts = [f"profile={self.profile_name or '?'}"]
+            if claude_cfg.get("model"):
+                banner_parts.append(f"model={claude_cfg['model']}")
+            if claude_cfg.get("effort"):
+                banner_parts.append(f"effort={claude_cfg['effort']}")
+            sys.stderr.write(f"[v{VERSION}] .unleashed.json: {', '.join(banner_parts)}\n")
+            sys.stderr.flush()
+
     def _purge_old_logs(self, max_age_days: int = 7):
         """Delete session logs older than max_age_days from logs/ directory."""
         log_dir = Path("logs")
@@ -672,10 +709,13 @@ class Unleashed:
             kernel32.SetConsoleMode(self.stdin_handle, self.original_mode)
 
     def _set_tab_title(self):
-        """Set terminal tab title to REPONAME YYYY-MM-DD HH:MM for easy identification."""
+        """Set terminal tab title to REPONAME [profile] YYYY-MM-DD HH:MM for easy identification."""
         repo_name = os.path.basename(self.cwd).upper()
         timestamp = time.strftime('%Y-%m-%d %H:%M')
-        title = f"{repo_name} {timestamp}"
+        if self.profile_name:
+            title = f"{repo_name} [{self.profile_name}] {timestamp}"
+        else:
+            title = f"{repo_name} {timestamp}"
         sys.stdout.write(f'\033]0;{title}\007')
         sys.stdout.flush()
         log(f"Tab title set: {title}")
@@ -1163,7 +1203,10 @@ class Unleashed:
 
         # v25: Telemetry — session.start after PTY spawns
         _repo_name = os.path.basename(self.cwd) if self.cwd else "unknown"
-        _telemetry_emit("session.start", repo=_repo_name, metadata={"version": VERSION})
+        _start_meta = {"version": VERSION}
+        if self.profile_name:
+            _start_meta["profile"] = self.profile_name
+        _telemetry_emit("session.start", repo=_repo_name, metadata=_start_meta)
 
         # v21: Initialize sentinel shadow log
         session_ts = time.strftime("%Y%m%d-%H%M%S")
@@ -1250,6 +1293,8 @@ class Unleashed:
             hrs, mins = divmod(mins, 60)
             dur = f"{hrs}h {mins}m {secs}s" if hrs else f"{mins}m {secs}s"
             sys.stderr.write(f"\n\u2500\u2500 unleashed v{VERSION} session summary \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n")
+            if self.profile_name:
+                sys.stderr.write(f"  Profile:      {self.profile_name}\n")
             sys.stderr.write(f"  Duration:     {dur}\n")
             sys.stderr.write(f"  Approvals:    {self.approval_count}\n")
             if self.sentinel_gate:
@@ -1267,12 +1312,15 @@ class Unleashed:
 
             # v25: Telemetry — session.end with metrics
             _friction_count = self.friction_logger.prompt_count if self.friction_logger else 0
-            _telemetry_emit("session.end", repo=_repo_name, metadata={
+            _end_meta = {
                 "version": VERSION,
                 "duration_s": int(elapsed),
                 "approval_count": self.approval_count,
                 "friction_prompts": _friction_count,
-            })
+            }
+            if self.profile_name:
+                _end_meta["profile"] = self.profile_name
+            _telemetry_emit("session.end", repo=_repo_name, metadata=_end_meta)
             _telemetry_flush()
 
             sys.exit(0)
