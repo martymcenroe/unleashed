@@ -601,7 +601,7 @@ class FrictionLogger:
 
 class Unleashed:
     def __init__(self, cwd=None, mirror=False, friction=False, joint_log=False,
-                 sentinel_shadow=False, sentinel_scope=None, console=False,
+                 sentinel_shadow=False, sentinel_scope=None, console=True,
                  home_tab=0, pickup=False, claude_args=None):
         self.cwd = cwd or os.getcwd()
         self.running = True
@@ -1388,7 +1388,8 @@ if __name__ == "__main__":
     parser.add_argument("--friction", action="store_true", default=True, help="Open permission friction logger tab (default: on)")
     parser.add_argument("--no-friction", action="store_false", dest="friction", help="Disable permission friction logger tab")
     parser.add_argument("--joint-log", action="store_true", help="Include permissions inline in session mirror (implies --mirror)")
-    parser.add_argument("--console", action="store_true", help="Open a bash console tab cd'd to target repo")
+    parser.add_argument("--console", action="store_true", default=True, help="Open a bash console tab cd'd to target repo (default: on)")
+    parser.add_argument("--no-console", action="store_false", dest="console", help="Disable console tab")
     parser.add_argument("--home-tab", type=int, default=0, help="Tab index to focus after launching companion tabs (default: 0)")
     parser.add_argument("--pickup", action="store_true", help="Auto-send /pickup after Claude initializes")
     parser.add_argument("--sentinel-shadow", action="store_true", help="Log sentinel context for every approval (shadow mode, no API calls)")
