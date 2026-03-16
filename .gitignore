@@ -33,3 +33,4 @@ data/
 
 # Personal redaction script
 src/redact.py
+data/unleashed/
