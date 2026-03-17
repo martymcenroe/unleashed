@@ -382,7 +382,7 @@ def extract_permission_context_structured(buffer: str) -> tuple:
 
 BASH_EXE = r"C:\Program Files\Git\usr\bin\bash.exe"
 
-def launch_tab(title: str, log_path: str):
+def launch_tab(title: str, log_path: str, session_id: str = ""):
     """Launch a Windows Terminal tab tailing the given log file."""
     try:
         abs_path = os.path.abspath(log_path)
@@ -391,20 +391,24 @@ def launch_tab(title: str, log_path: str):
         if unix_path[1] == ':':
             unix_path = '/' + unix_path[0].lower() + unix_path[2:]
 
+        # Embed session marker so cleanup can find this process (#84)
+        sid_export = f"export UNLEASHED_SID={session_id}; " if session_id else ""
         # Must use full path to bash.exe — Git Bash isn't in the Windows system PATH
-        cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "tail -f \'{unix_path}\'"'
+        cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "{sid_export}tail -f \'{unix_path}\'"'
         log(f"Launching tab: {cmd}")
         subprocess.Popen(cmd, shell=True)
     except Exception as e:
         log(f"WARNING: Failed to launch tab '{title}': {e}")
 
-def launch_console_tab(project: str, cwd: str):
+def launch_console_tab(project: str, cwd: str, session_id: str = ""):
     """Launch a Windows Terminal tab with a bash shell cd'd to the target repo."""
     try:
         unix_cwd = cwd.replace("\\", "/")
         if unix_cwd[1] == ':':
             unix_cwd = '/' + unix_cwd[0].lower() + unix_cwd[2:]
-        cmd = f'wt.exe -w 0 nt --title "Console: {project}" --suppressApplicationTitle "{BASH_EXE}" --login -c "cd \'{unix_cwd}\' && exec bash --login"'
+        # Embed session marker so cleanup can find this process (#84)
+        sid_export = f"export UNLEASHED_SID={session_id}; " if session_id else ""
+        cmd = f'wt.exe -w 0 nt --title "Console: {project}" --suppressApplicationTitle "{BASH_EXE}" --login -c "{sid_export}cd \'{unix_cwd}\' && exec bash --login"'
         log(f"Launching console tab: {cmd}")
         subprocess.Popen(cmd, shell=True)
     except Exception as e:
@@ -639,6 +643,7 @@ class Unleashed:
         self.sentinel_scope = sentinel_scope
         self.sentinel_gate = None
         self._shadow_fh = None
+        self._session_ts = None  # #84: set in run(), used for companion cleanup
         log(f"Initialized v{VERSION} in {self.cwd} (mirror={mirror}, friction={friction}, joint_log={joint_log}, sentinel_shadow={sentinel_shadow}, sentinel_scope={sentinel_scope}, pickup={pickup}, claude_args={self.claude_args})")
 
     # v27: Model name to Claude CLI model ID mapping
@@ -1201,6 +1206,40 @@ class Unleashed:
         time.sleep(0.1)
         self.in_approval = False
 
+    def _cleanup_companions(self):
+        """Kill companion tab processes launched by this session (#84).
+
+        Companion tabs (mirror tail, friction tail, console bash) are launched
+        via wt.exe which exits immediately — no parent-child link exists.
+        Each companion's bash command includes UNLEASHED_SID=<session_ts> in
+        its command line. We find matching processes via wmic and kill them.
+        """
+        if not self._session_ts:
+            return
+        marker = f"UNLEASHED_SID={self._session_ts}"
+        try:
+            result = subprocess.run(
+                ['wmic', 'process', 'where',
+                 f"CommandLine like '%{marker}%'",
+                 'get', 'ProcessId'],
+                capture_output=True, text=True, timeout=10
+            )
+            pids = [line.strip() for line in result.stdout.strip().split('\n')
+                    if line.strip().isdigit()]
+            for pid in pids:
+                try:
+                    subprocess.run(['taskkill', '/PID', pid, '/T', '/F'],
+                                   capture_output=True, timeout=5)
+                    log(f"Killed companion PID={pid}")
+                except Exception as e:
+                    log(f"WARNING: Failed to kill companion PID={pid}: {e}")
+            if pids:
+                log(f"Companion cleanup: killed {len(pids)} processes")
+            else:
+                log("Companion cleanup: no orphaned processes found")
+        except Exception as e:
+            log(f"WARNING: Companion cleanup failed: {e}")
+
     def run(self):
         self.session_start = time.time()
         sys.stderr.write(f"[Unleashed v{VERSION}] Starting...\n")
@@ -1254,6 +1293,7 @@ class Unleashed:
 
         # v21: Initialize sentinel shadow log
         session_ts = time.strftime("%Y%m%d-%H%M%S")
+        self._session_ts = session_ts  # #84: for companion cleanup
         session_id = f"unleashed-{session_ts}"
 
         # v26: Compute per-repo log directory (same as raw transcripts)
@@ -1298,14 +1338,14 @@ class Unleashed:
 
         # Launch tabs AFTER creating log files so tail -f has a file to open
         if self.mirror:
-            launch_tab("Session Mirror", self.session_logger.path)
+            launch_tab("Session Mirror", self.session_logger.path, session_id=session_ts)
 
         if self.friction:
-            launch_tab("Friction", self.friction_logger.human_path)
+            launch_tab("Friction", self.friction_logger.human_path, session_id=session_ts)
 
         # v26 #67: Optional console tab cd'd to target repo
         if self.console:
-            launch_console_tab(_project, self.cwd)
+            launch_console_tab(_project, self.cwd, session_id=session_ts)
 
         # v26 #66: Focus back to Claude session tab after launching companion tabs
         if self.mirror or self.friction or self.console:
@@ -1326,6 +1366,7 @@ class Unleashed:
             pass
         finally:
             self.running = False
+            self._cleanup_companions()  # #84: kill companion tabs before they orphan
             time.sleep(0.2)
 
             # v21: flush any remaining mirror buffer before closing
