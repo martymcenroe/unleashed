@@ -242,7 +242,7 @@ def launch_tab(title: str, log_path: str, session_id: str = ""):
         if len(unix_path) > 1 and unix_path[1] == ":":
             unix_path = "/" + unix_path[0].lower() + unix_path[2:]
         # Embed session marker so cleanup can find this process (#84)
-        sid_export = f"export UNLEASHED_SID={session_id}; " if session_id else ""
+        sid_export = f"export UNLEASHED_SID={session_id} && " if session_id else ""
         cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "{sid_export}tail -f \'{unix_path}\'"'
         log(f"Launching tab: {cmd}")
         subprocess.Popen(cmd, shell=True)
@@ -256,7 +256,7 @@ def launch_console_tab(project: str, cwd: str, session_id: str = ""):
         if unix_cwd[1] == ':':
             unix_cwd = '/' + unix_cwd[0].lower() + unix_cwd[2:]
         # Embed session marker so cleanup can find this process (#84)
-        sid_export = f"export UNLEASHED_SID={session_id}; " if session_id else ""
+        sid_export = f"export UNLEASHED_SID={session_id} && " if session_id else ""
         cmd = f'wt.exe -w 0 nt --title "Console: {project}" --suppressApplicationTitle "{BASH_EXE}" --login -c "{sid_export}cd \'{unix_cwd}\' && exec bash --login"'
         log(f"Launching console tab: {cmd}")
         subprocess.Popen(cmd, shell=True)
