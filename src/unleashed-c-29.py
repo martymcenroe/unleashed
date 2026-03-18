@@ -105,6 +105,10 @@ ANSI_RE = re.compile(rb'\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][AB012]
 
 MULTI_SPACE_RE = re.compile(rb' {2,}')
 
+# v29: Compaction emergency — match actual status bar, not conversation text (#123)
+# Status bar: "[02-13 18:31:29]  Context left until auto-compact: 0%"
+COMPACTION_0_RE = re.compile(rb'\d{2}:\d{2}:\d{2}\]?\s+Context\s+left\s+until\s+auto-compact:\s*0%')
+
 # ---------------------------------------------------------------------------
 # Session mirror filtering
 # ---------------------------------------------------------------------------
@@ -632,7 +636,7 @@ class Unleashed:
         self._handoff_pty = None  # set in run(), used by timer callback
         self.handoff_reminder_minutes = 0  # Disabled — user watches green bar, not timers
         self.handoff_timer_action = "remind"  # "remind" or "inject"
-        self.handoff_compaction_trigger = False  # Disabled — substring match fires on conversation text (#119)
+        self.handoff_compaction_trigger = True  # v29: re-enabled with proper status bar regex (#123)
         self.claude_args = claude_args or []  # extra args passed through to claude.cmd
         self.session_logger = None
         self.friction_logger = None
@@ -1065,10 +1069,10 @@ class Unleashed:
                         pty.write('/pickup\r')
                         log("Auto-sent /pickup")
 
-                # v28: Compaction emergency trigger — detect 'auto-compact' in PTY stream
+                # v29: Compaction emergency trigger — match status bar at 0%, not conversation text (#123)
                 if self.handoff_compaction_trigger and not self._handoff_sent:
-                    if b'auto-compact' in clean_chunk:
-                        log("Detected 'auto-compact' in PTY stream — context at 0%")
+                    if COMPACTION_0_RE.search(clean_chunk):
+                        log("Detected auto-compact 0% in status bar — emergency handoff")
                         threading.Thread(
                             target=self._inject_handoff,
                             args=("compaction",),
