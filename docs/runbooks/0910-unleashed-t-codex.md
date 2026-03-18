@@ -117,6 +117,57 @@ After a run, verify:
 - the friction files exist when friction is enabled
 - the session summary printed on exit
 
+## Codex Sandbox Proxy Behavior
+
+Codex CLI's Windows sandbox injects proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `GIT_HTTP_PROXY`, `GIT_HTTPS_PROXY` = `http://127.0.0.1:9`) to null-route all HTTP traffic. This is by design — the `--full-auto` help text says "network-disabled sandbox."
+
+The proxy is injected by `codex.exe` itself after launch, not by unleashed or any user config. The unleashed-t wrapper passes `os.environ.copy()` (clean, no proxy vars) but Codex adds them internally.
+
+### Mitigation
+
+The wrapper sets `NO_PROXY=*` in the env before spawn. Most HTTP clients (curl, gh, git, requests) respect `NO_PROXY` and skip the proxy for matching hosts. `*` means all hosts.
+
+Additionally, the wrapper passes `-c shell_environment_policy.inherit=all` to Codex, which instructs Codex to inherit the parent environment without overriding it.
+
+### Fallback
+
+If `NO_PROXY=*` doesn't survive Codex's sandbox injection, create a wrapper script that unsets the proxy vars before calling gh:
+
+```bash
+#!/bin/bash
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY GIT_HTTP_PROXY GIT_HTTPS_PROXY
+exec gh "$@"
+```
+
+Prepend a PATH directory containing this wrapper, or set `GH_PATH` to point to it.
+
+### Verification
+
+Inside a Codex session:
+
+```bash
+env | grep -i proxy       # Check NO_PROXY=* is present
+gh issue list -R octocat/Hello-World --limit 3   # Should succeed
+```
+
+## Web Search
+
+The `--search` flag enables Codex's web search capability. This is passed by default in the wrapper's codex_cmd construction. No config.toml key exists for this — it's CLI-flag only as of Codex 0.115.0.
+
+## Config Boundaries (Codex 0.115.0)
+
+Documented/verified settings used by the wrapper:
+
+| Setting | Value | Mechanism |
+|---------|-------|-----------|
+| Model | gpt-5.4 | config.toml |
+| Sandbox | workspace-write | `-s` flag |
+| Approval | never | `-a` flag |
+| shell_environment_policy.inherit | all | `-c` flag |
+| Web search | enabled | `--search` flag |
+
+**Not documented** in `codex --help` or `config.toml`: reasoning effort, output verbosity, context window, output token limit. Do not guess config keys for these.
+
 ## Troubleshooting
 
 ### `pywinpty` import failure
