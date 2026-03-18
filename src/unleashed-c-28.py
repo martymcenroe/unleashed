@@ -630,7 +630,7 @@ class Unleashed:
         self._handoff_sent = False
         self._handoff_timer = None
         self._handoff_pty = None  # set in run(), used by timer callback
-        self.handoff_reminder_minutes = 120
+        self.handoff_reminder_minutes = 0  # Disabled — user watches green bar, not timers
         self.handoff_timer_action = "remind"  # "remind" or "inject"
         self.handoff_compaction_trigger = True
         self.claude_args = claude_args or []  # extra args passed through to claude.cmd
