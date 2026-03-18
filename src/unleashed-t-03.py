@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-Unleashed-T - v01
+Unleashed-T - v03 (alpha)
 Codex CLI wrapper with PTY handling, live session logs, and companion tabs.
 
-v01 scope:
+v03 changes (#105, #107):
+- Proxy fix: NO_PROXY=* to bypass Codex sandbox proxy (127.0.0.1:9)
+- Config: -c shell_environment_policy.inherit=all to preserve parent env
+- Web search: --search flag for Codex web search capability
+
+Prior (v02, tier 1 parity with c-27, #78):
+- Console tab: --console (default on), bash shell cd'd to target repo
+- Per-repo session logs: save to {target_repo}/data/unleashed/ with project name
+- Tab focus-back: return focus to session tab after launching companions
+
+Prior (v01):
 - Launch Codex in --full-auto mode by default
 - Three-thread PTY wrapper (stdin, PTY reader, resize monitor)
-- Raw PTY tee to logs/codex-session-{ts}.raw
-- ANSI-stripped mirror log filtered through transcript_filters.py
-- Friction logger scaffold (records zero prompts in full-auto mode)
+- Raw PTY tee, ANSI-stripped mirror, friction logger scaffold
 - Auto-tab naming: REPONAME YYYY-MM-DD HH:MM
 - Companion tabs for clean mirror and friction logs
 """
@@ -26,10 +34,11 @@ import threading
 import time
 from collections import deque
 from ctypes import wintypes
+from pathlib import Path
 
 from transcript_filters import is_garbage
 
-VERSION = "t-01"
+VERSION = "t-03"
 LOG_FILE = os.path.join("logs", f"unleashed-{VERSION}.log")
 CODEX_CMD = r"C:\Users\mcwiz\AppData\Roaming\npm\codex.cmd"
 BASH_EXE = r"C:\Program Files\Git\usr\bin\bash.exe"
@@ -231,22 +240,47 @@ def mirror_strip_ansi(data: bytes) -> bytes:
     return b"".join(result)
 
 
-def launch_tab(title: str, log_path: str):
+def launch_tab(title: str, log_path: str, session_id: str = ""):
     try:
         abs_path = os.path.abspath(log_path)
         unix_path = abs_path.replace("\\", "/")
         if len(unix_path) > 1 and unix_path[1] == ":":
             unix_path = "/" + unix_path[0].lower() + unix_path[2:]
-        cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "tail -f \'{unix_path}\'"'
+        # Embed session marker so cleanup can find this process (#84)
+        sid_export = f"export UNLEASHED_SID={session_id} && " if session_id else ""
+        cmd = f'wt.exe -w 0 nt --title "{title}" --suppressApplicationTitle "{BASH_EXE}" -c "{sid_export}tail -f \'{unix_path}\'"'
         log(f"Launching tab: {cmd}")
         subprocess.Popen(cmd, shell=True)
     except Exception as e:
         log(f"WARNING: Failed to launch tab '{title}': {e}")
 
+def launch_console_tab(project: str, cwd: str, session_id: str = ""):
+    """Launch a Windows Terminal tab with a bash shell cd'd to the target repo."""
+    try:
+        unix_cwd = cwd.replace("\\", "/")
+        if unix_cwd[1] == ':':
+            unix_cwd = '/' + unix_cwd[0].lower() + unix_cwd[2:]
+        # Embed session marker so cleanup can find this process (#84)
+        sid_export = f"export UNLEASHED_SID={session_id} && " if session_id else ""
+        cmd = f'wt.exe -w 0 nt --title "Console: {project}" --suppressApplicationTitle "{BASH_EXE}" --login -c "{sid_export}cd \'{unix_cwd}\' && exec bash --login"'
+        log(f"Launching console tab: {cmd}")
+        subprocess.Popen(cmd, shell=True)
+    except Exception as e:
+        log(f"WARNING: Failed to launch console tab: {e}")
+
+def focus_tab(index: int = 0):
+    """Focus a Windows Terminal tab by index after launching companion tabs."""
+    try:
+        cmd = f'wt.exe -w 0 ft --target {index}'
+        log(f"Focusing tab: {cmd}")
+        subprocess.Popen(cmd, shell=True)
+    except Exception as e:
+        log(f"WARNING: Failed to focus tab {index}: {e}")
+
 
 class SessionLogger:
-    def __init__(self, session_ts: str):
-        self.path = os.path.join("logs", f"codex-session-{session_ts}.log")
+    def __init__(self, session_ts: str, log_dir: str = "logs", project: str = "codex"):
+        self.path = os.path.join(log_dir, f"codex-mirror-{project}-{session_ts}.log")
         self.fh = open(self.path, "a", encoding="utf-8")
         self.line_count = 0
         self.fh.write(f"{'=' * 60}\n")
@@ -296,9 +330,9 @@ class SessionLogger:
 
 
 class FrictionLogger:
-    def __init__(self, session_ts: str):
-        self.human_path = os.path.join("logs", f"codex-friction-{session_ts}.log")
-        self.jsonl_path = os.path.join("logs", f"codex-friction-{session_ts}.jsonl")
+    def __init__(self, session_ts: str, log_dir: str = "logs", project: str = "codex"):
+        self.human_path = os.path.join(log_dir, f"codex-friction-{project}-{session_ts}.log")
+        self.jsonl_path = os.path.join(log_dir, f"codex-friction-{project}-{session_ts}.jsonl")
         self.session_start = time.time()
         self.prompt_count = 0
         self.fh_human = open(self.human_path, "a", encoding="utf-8")
@@ -338,18 +372,21 @@ class FrictionLogger:
 
 
 class UnleashedT:
-    def __init__(self, cwd=None, mirror=True, friction=True, codex_args=None):
+    def __init__(self, cwd=None, mirror=True, friction=True, console=True, home_tab=0, codex_args=None):
         self.cwd = cwd or os.getcwd()
         self.running = True
         self.stdin_handle = None
         self.original_mode = None
         self.mirror = mirror
         self.friction = friction
+        self.console = console
+        self.home_tab = home_tab
         self.codex_args = codex_args or []
         self.session_fh = None
         self.session_logger = None
         self.friction_logger = None
         self.session_start = None
+        self._session_ts = None          # #84: for companion cleanup
         self._mirror_buffer = b""
         self._mirror_last_flush = 0.0
         self._mirror_recent = deque(maxlen=32)
@@ -617,9 +654,38 @@ class UnleashedT:
                 log(f"PTY reader error: {e}")
                 break
 
+    def _cleanup_companions(self):
+        """Kill companion tab processes launched by this session (#84)."""
+        if not self._session_ts:
+            return
+        marker = f"UNLEASHED_SID={self._session_ts}"
+        try:
+            result = subprocess.run(
+                ['wmic', 'process', 'where',
+                 f"CommandLine like '%{marker}%'",
+                 'get', 'ProcessId'],
+                capture_output=True, text=True, timeout=10
+            )
+            pids = [line.strip() for line in result.stdout.strip().split('\n')
+                    if line.strip().isdigit()]
+            for pid in pids:
+                try:
+                    subprocess.run(['taskkill', '/PID', pid, '/T', '/F'],
+                                   capture_output=True, timeout=5)
+                    log(f"Killed companion PID={pid}")
+                except Exception as e:
+                    log(f"WARNING: Failed to kill companion PID={pid}: {e}")
+            if pids:
+                log(f"Companion cleanup: killed {len(pids)} processes")
+            else:
+                log("Companion cleanup: no orphaned processes found")
+        except Exception as e:
+            log(f"WARNING: Companion cleanup failed: {e}")
+
     def run(self):
         self.session_start = time.time()
         session_ts = time.strftime("%Y%m%d-%H%M%S")
+        self._session_ts = session_ts  # #84: for companion cleanup
 
         sys.stderr.write(f"[Unleashed-T {VERSION}] Starting...\n")
         sys.stderr.flush()
@@ -636,25 +702,47 @@ class UnleashedT:
         atexit.register(self._restore_console)
         self._set_tab_title()
 
-        session_log_path = os.path.join("logs", f"codex-session-{session_ts}.raw")
+        # v02: per-repo session logs
+        _project = Path(self.cwd).name
+        transcript_dir = Path(self.cwd) / 'data' / 'unleashed'
+        transcript_dir.mkdir(parents=True, exist_ok=True)
+        _log_dir = str(transcript_dir)
+
+        session_log_path = os.path.join(_log_dir, f"codex-session-{_project}-{session_ts}.raw")
         self.session_fh = open(session_log_path, "wb")
         log(f"Raw session log: {session_log_path}")
-        if self.mirror:
-            launch_tab("Codex Raw", session_log_path)
+        sys.stderr.write(f"[Unleashed-T {VERSION}] Transcript: {session_log_path}\n")
+        sys.stderr.flush()
 
-        self.session_logger = SessionLogger(session_ts)
+        if self.mirror:
+            launch_tab("Codex Raw", session_log_path, session_id=session_ts)
+
+        self.session_logger = SessionLogger(session_ts, log_dir=_log_dir, project=_project)
         log(f"Session mirror: {self.session_logger.path}")
 
         if self.friction:
-            self.friction_logger = FrictionLogger(session_ts)
+            self.friction_logger = FrictionLogger(session_ts, log_dir=_log_dir, project=_project)
             log(f"Friction logger: {self.friction_logger.human_path}")
-            launch_tab("Codex Friction", self.friction_logger.human_path)
+            launch_tab("Codex Friction", self.friction_logger.human_path, session_id=session_ts)
+
+        # v02 #67: console tab cd'd to target repo
+        if self.console:
+            launch_console_tab(_project, self.cwd, session_id=session_ts)
+
+        # v02 #66: focus back to session tab after launching companions
+        if self.mirror or self.friction or self.console:
+            time.sleep(0.3)
+            focus_tab(self.home_tab)
 
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         env["UNLEASHED_VERSION"] = VERSION
+        env["NO_PROXY"] = "*"  # Bypass Codex sandbox proxy (127.0.0.1:9) for gh/git
 
-        codex_cmd = ["cmd", "/c", CODEX_CMD, "-a", "never", "-s", "workspace-write"] + self.codex_args
+        codex_cmd = ["cmd", "/c", CODEX_CMD,
+                     "-a", "never", "-s", "workspace-write",
+                     "-c", "shell_environment_policy.inherit=all",
+                     "--search"] + self.codex_args
         log(f"Spawning: {codex_cmd}")
 
         try:
@@ -687,6 +775,7 @@ class UnleashedT:
             pass
         finally:
             self.running = False
+            self._cleanup_companions()  # #84: kill companion tabs before they orphan
             time.sleep(0.2)
             self._flush_mirror(final=True)
 
@@ -729,5 +818,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-mirror", action="store_false", dest="mirror", help="Disable raw session log tab")
     parser.add_argument("--friction", action="store_true", default=True, help="Open friction logger tab (default: on)")
     parser.add_argument("--no-friction", action="store_false", dest="friction", help="Disable friction logger tab")
+    parser.add_argument("--console", action="store_true", default=True, help="Open a bash console tab cd'd to target repo (default: on)")
+    parser.add_argument("--no-console", action="store_false", dest="console", help="Disable console tab")
+    parser.add_argument("--home-tab", type=int, default=0, help="Tab index to focus after launching companion tabs (default: 0)")
     args, codex_args = parser.parse_known_args()
-    UnleashedT(cwd=args.cwd, mirror=args.mirror, friction=args.friction, codex_args=codex_args).run()
+    UnleashedT(cwd=args.cwd, mirror=args.mirror, friction=args.friction,
+               console=args.console, home_tab=args.home_tab, codex_args=codex_args).run()
