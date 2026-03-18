@@ -732,8 +732,12 @@ class UnleashedT:
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         env["UNLEASHED_VERSION"] = VERSION
+        env["NO_PROXY"] = "*"  # Bypass Codex sandbox proxy (127.0.0.1:9) for gh/git
 
-        codex_cmd = ["cmd", "/c", CODEX_CMD, "-a", "never", "-s", "workspace-write"] + self.codex_args
+        codex_cmd = ["cmd", "/c", CODEX_CMD,
+                     "-a", "never", "-s", "workspace-write",
+                     "-c", "shell_environment_policy.inherit=all",
+                     "--search"] + self.codex_args
         log(f"Spawning: {codex_cmd}")
 
         try:
