@@ -732,15 +732,8 @@ class UnleashedT:
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         env["UNLEASHED_VERSION"] = VERSION
-        env["NO_PROXY"] = "*"  # Bypass Codex sandbox proxy (127.0.0.1:9) for gh/git
-        env["GIT_CONFIG_COUNT"] = "1"  # Sandbox strips schannel credentials (#113)
-        env["GIT_CONFIG_KEY_0"] = "http.sslBackend"
-        env["GIT_CONFIG_VALUE_0"] = "openssl"
 
-        codex_cmd = ["cmd", "/c", CODEX_CMD,
-                     "-a", "never", "-s", "workspace-write",
-                     "-c", "shell_environment_policy.inherit=all",
-                     "--search"] + self.codex_args
+        codex_cmd = ["cmd", "/c", CODEX_CMD, "-a", "never", "-s", "workspace-write"] + self.codex_args
         log(f"Spawning: {codex_cmd}")
 
         try:
