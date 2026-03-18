@@ -632,7 +632,7 @@ class Unleashed:
         self._handoff_pty = None  # set in run(), used by timer callback
         self.handoff_reminder_minutes = 0  # Disabled — user watches green bar, not timers
         self.handoff_timer_action = "remind"  # "remind" or "inject"
-        self.handoff_compaction_trigger = True
+        self.handoff_compaction_trigger = False  # Disabled — substring match fires on conversation text (#119)
         self.claude_args = claude_args or []  # extra args passed through to claude.cmd
         self.session_logger = None
         self.friction_logger = None
