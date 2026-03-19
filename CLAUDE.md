@@ -4,13 +4,13 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 
 ## Key Files
 
-- `src/unleashed-c-18.py` — Claude production (PTY wrapper with auto-approval)
-- `src/unleashed-c-23.py` — Claude latest (mirror noise filters + typeahead prompt collapsing)
-- `src/unleashed-c-24.py` — Claude beta (auto-tab-naming)
-- `src/unleashed-g-19.py` — Gemini production (triplet + 3 permission patterns)
+- `src/unleashed-c-28.py` — Claude production (auto-handoff: compaction trigger + timer reminder)
+- `src/unleashed-c-29.py` — Claude alpha (c-28 + compaction regex fix, timer via tab title)
+- `src/unleashed-g-20.py` — Gemini production (g-19 + console tab, per-repo logs, focus-back, auto-tab-naming)
+- `src/unleashed-g-19.py` — Gemini historical (triplet + 3 permission patterns)
+- `src/unleashed-t-03.py` — Codex production (t-02 + proxy fix, schannel→openssl, --search)
 - `src/unleashed-t-01.py` — Codex historical (PTY wrapper, session logging)
 - `src/unleashed-t-02.py` — Codex historical (t-01 + console tab, per-repo logs, focus-back)
-- `src/unleashed-t-03.py` — Codex production (t-02 + proxy fix, schannel→openssl, --search)
 - `src/sentinel.py` — Standalone security gatekeeper (CLI)
 - `src/sentinel_gate.py` — Sentinel gate class (Haiku API, worker thread)
 - `src/sentinel_rules.py` — Local regex rules from `~/.agentos/` safety data
@@ -21,10 +21,9 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 ## Running
 
 ```bash
-unleashed              # Claude production (c-18)
-unleashed-c-21-triplet # Claude latest with mirror + friction tabs
-unleashed-g            # Gemini production (g-19)
-unleashed-sentinel     # Latest with sentinel gate (Bash-only)
+unleashed              # Claude production (c-28)
+unleashed-alpha        # Claude alpha (c-29)
+unleashed-g            # Gemini production (g-20)
 unleashed-t            # Codex production (t-03)
 sentinel               # Standalone security check
 ```
