@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Unleashed - v00031
+- Feat: Python-side pickup — preloads handoff context in wrapper, ~1000 fewer Opus tokens (#136)
 - Fix: Reduce idle CPU ~213 wakeups/sec -> ~10 (#134)
   - F1: Event-driven main loop (threading.Event replaces spin-wait)
   - F2: WaitForSingleObject for stdin (replaces 200Hz polling)
@@ -656,6 +657,7 @@ class Unleashed:
         self.approval_count = 0          # #46: total auto-approvals this session
         self.session_start = None        # #46: set in run()
         self._done_event = threading.Event()  # v31: event-driven main loop (#134)
+        self._config_echo = None  # v31: deferred config echo (injected into PTY stream)
         # v20: raw transcript save
         self.transcript_file = None
         # v21: rate-limited mirror writes
@@ -678,12 +680,6 @@ class Unleashed:
         "haiku": "haiku",
     }
 
-    # v30: Model window sizes for startup echo
-    MODEL_WINDOWS = {
-        "opus": "200K",
-        "sonnet": "200K",
-        "haiku": "200K",
-    }
 
     def _load_repo_config(self):
         """Read .unleashed.json from target repo and apply CLI-level config (#57, #129).
@@ -710,14 +706,11 @@ class Unleashed:
                 self.claude_args = ['--effort', effort] + self.claude_args
                 log(f"Repo config: effort={effort}")
 
-            # v30: startup echo — model/effort/window/assemblyZero
-            window = self.MODEL_WINDOWS.get(model, "200K") if model else "200K"
-            echo_line = (f"[v{VERSION}] Config: model={model or 'default'} | "
-                         f"effort={effort or 'default'} | window={window} | "
-                         f"assemblyZero={config.get('assemblyZero', False)}")
-            sys.stderr.write(echo_line + "\n")
-            sys.stderr.flush()
-            log(echo_line)
+            # v31: deferred config echo — stored here, injected into PTY stream after TUI renders
+            self._config_echo = (f"[v{VERSION}] Config: model={model or 'default'} | "
+                                 f"effort={effort or 'default'} | "
+                                 f"assemblyZero={config.get('assemblyZero', False)}")
+            log(self._config_echo)
 
             # v28: handoff config
             handoff_config = config.get('handoff', {})
@@ -749,6 +742,304 @@ class Unleashed:
             log(f"WARNING: Failed to read .unleashed.json: {e}")
             sys.stderr.write(f"[v{VERSION}] WARNING: Bad .unleashed.json: {e}\n")
             sys.stderr.flush()
+
+    # ── Python-side pickup (#136) ──────────────────────────────────────
+
+    def _parse_last_handoff(self):
+        """Parse last handoff entry from data/handoff-log.md.
+
+        Returns dict with keys: timestamp, age_minutes, content, files
+        or None if no handoff found or parse fails.
+        """
+        try:
+            handoff_path = Path(self.cwd) / 'data' / 'handoff-log.md'
+            if not handoff_path.exists():
+                return None
+            text = handoff_path.read_text(encoding='utf-8', errors='replace')
+
+            # Find all start/end marker positions
+            starts = [i for i in range(len(text)) if text[i:].startswith('<!-- handoff-start -->')]
+            ends = [i for i in range(len(text)) if text[i:].startswith('<!-- handoff-end -->')]
+            if not starts or not ends:
+                return None
+
+            last_start = starts[-1]
+            last_end = ends[-1]
+            if last_end <= last_start:
+                return None
+
+            # Extract content between markers
+            content_start = last_start + len('<!-- handoff-start -->')
+            content = text[content_start:last_end].strip()
+
+            # Extract timestamp from header above the start marker
+            # Look backwards from start marker for "## Handoff — YYYY-MM-DD HH:MM:SS"
+            preamble = text[:last_start]
+            ts_match = re.search(
+                r'## Handoff\s*[—–\-]+\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
+                preamble
+            )
+            if not ts_match:
+                log("WARNING: handoff-log has markers but no parseable timestamp")
+                return None
+
+            handoff_dt = datetime.datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
+            age_minutes = (datetime.datetime.now() - handoff_dt).total_seconds() / 60
+
+            # Parse "Files to Read First" section
+            files = []
+            files_section = re.search(r'## Files to Read First\s*\n(.*?)(?=\n##|\Z)',
+                                      content, re.DOTALL)
+            if files_section:
+                for line in files_section.group(1).split('\n'):
+                    path_match = re.match(r'^\d+\.\s*`([^`]+)`', line)
+                    if not path_match:
+                        continue
+                    raw_path = path_match.group(1)
+                    # Strip line-range suffixes (e.g. :629-635)
+                    raw_path = re.sub(r':\d+(-\d+)?$', '', raw_path)
+                    # Skip CLAUDE.md (auto-loaded by Claude Code)
+                    if re.search(r'(?:^|[\\/])CLAUDE\.md$', raw_path):
+                        continue
+                    # Resolve relative paths against cwd
+                    p = Path(raw_path)
+                    if not p.is_absolute():
+                        p = Path(self.cwd) / p
+                    files.append(str(p))
+
+            return {
+                "timestamp": handoff_dt,
+                "age_minutes": age_minutes,
+                "content": content,
+                "files": files,
+            }
+        except Exception as e:
+            log(f"WARNING: _parse_last_handoff failed: {e}")
+            return None
+
+    def _check_session_health(self, handoff_ts):
+        """Check session-index.jsonl for thrashing or crash patterns.
+
+        Returns dict with status: "ok", "thrashing", "crash", "no_index", or "error".
+        """
+        try:
+            index_path = Path(self.cwd) / 'data' / 'session-index.jsonl'
+            if not index_path.exists():
+                return {"status": "no_index"}
+
+            entries = []
+            for line in index_path.read_text(encoding='utf-8').strip().split('\n'):
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+            if not entries:
+                return {"status": "no_index"}
+
+            last_5 = entries[-5:]
+
+            # Thrashing: 3+ entries within 30 min, each with line_count < 50
+            brief_entries = []
+            for e in last_5:
+                if e.get('line_count', 0) < 50:
+                    try:
+                        brief_entries.append(datetime.datetime.fromisoformat(e['start']))
+                    except (KeyError, ValueError):
+                        continue
+            if len(brief_entries) >= 3:
+                brief_entries.sort()
+                for i in range(len(brief_entries) - 2):
+                    window = (brief_entries[i + 2] - brief_entries[i]).total_seconds() / 60
+                    if window <= 30:
+                        # Find last substantive session
+                        last_sub = None
+                        for e in reversed(entries):
+                            if e.get('line_count', 0) >= 50:
+                                last_sub = e.get('sid', 'unknown')
+                                break
+                        return {
+                            "status": "thrashing",
+                            "count": len(brief_entries),
+                            "last_substantive_sid": last_sub,
+                        }
+
+            # Crash: last entry substantive + no handoff after it
+            last_entry = entries[-1]
+            if last_entry.get('line_count', 0) >= 50:
+                try:
+                    session_start = datetime.datetime.fromisoformat(last_entry['start'])
+                    if handoff_ts < session_start:
+                        return {
+                            "status": "crash",
+                            "session": last_entry,
+                        }
+                except (KeyError, ValueError):
+                    pass
+
+            return {"status": "ok"}
+        except Exception as e:
+            log(f"WARNING: _check_session_health failed: {e}")
+            return {"status": "error"}
+
+    def _compose_pickup_context(self, handoff):
+        """Build pickup context file from handoff data and preloaded files.
+
+        Writes to data/.pickup-context.md. Returns file path or None on failure.
+        """
+        try:
+            project = Path(self.cwd).name
+            age_str = f"{handoff['age_minutes']:.0f}m"
+            files_loaded = 0
+
+            lines = [
+                f"# Pickup Context (unleashed v{VERSION})",
+                f"Age: {age_str} | Project: {project}",
+                "",
+                "## Handoff",
+                "",
+                handoff["content"],
+                "",
+            ]
+
+            # Open issues via gh CLI
+            try:
+                remote_result = subprocess.run(
+                    ['git', '-C', self.cwd, 'remote', 'get-url', 'origin'],
+                    capture_output=True, text=True, timeout=5
+                )
+                repo_match = re.search(r'github\.com[:/](.+?)(?:\.git)?$',
+                                       remote_result.stdout.strip())
+                if repo_match:
+                    owner_repo = repo_match.group(1)
+                    issues_result = subprocess.run(
+                        ['gh', 'issue', 'list', '--state', 'open', '--limit', '10',
+                         '--repo', owner_repo],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    lines.append("## Open Issues")
+                    lines.append("")
+                    if issues_result.returncode == 0 and issues_result.stdout.strip():
+                        lines.append(issues_result.stdout.strip())
+                    else:
+                        lines.append("No open issues or gh CLI unavailable.")
+                    lines.append("")
+            except Exception as e:
+                lines.append("## Open Issues")
+                lines.append("")
+                lines.append(f"Unavailable: {e}")
+                lines.append("")
+                log(f"WARNING: gh issue list failed in pickup: {e}")
+
+            # Preload files
+            if handoff["files"]:
+                lines.append("## Preloaded Files")
+                lines.append("")
+                for fpath in handoff["files"]:
+                    p = Path(fpath)
+                    if not p.exists():
+                        lines.append(f"### {fpath}")
+                        lines.append("")
+                        lines.append(f"[File not found — may have been renamed or removed]")
+                        lines.append("")
+                        continue
+                    try:
+                        file_text = p.read_text(encoding='utf-8', errors='replace')
+                        file_lines = file_text.split('\n')
+                        if len(file_lines) > 500:
+                            file_text = '\n'.join(file_lines[:500])
+                            file_text += f"\n[... truncated at 500 of {len(file_lines)} lines ...]"
+                        lines.append(f"### {fpath}")
+                        lines.append("")
+                        lines.append(file_text)
+                        lines.append("")
+                        files_loaded += 1
+                    except Exception as e:
+                        lines.append(f"### {fpath}")
+                        lines.append("")
+                        lines.append(f"[Read failed: {e}]")
+                        lines.append("")
+                        log(f"WARNING: Failed to read {fpath} for pickup: {e}")
+
+            context_text = '\n'.join(lines)
+            context_path = Path(self.cwd) / 'data' / '.pickup-context.md'
+            context_path.parent.mkdir(parents=True, exist_ok=True)
+            context_path.write_text(context_text, encoding='utf-8')
+
+            log(f"Pickup context: {context_path} ({files_loaded} files, "
+                f"{len(context_text)} chars)")
+            return str(context_path), files_loaded
+        except Exception as e:
+            log(f"WARNING: _compose_pickup_context failed: {e}")
+            return None
+
+    def _attempt_python_pickup(self, pty):
+        """Try Python-side pickup. Returns True if handled, False to fall through.
+
+        Called from _reader_pty after first prompt detected. On success, injects
+        a short message into PTY pointing Claude to the preloaded context file.
+        On failure or non-pickup conditions, returns False so the caller can
+        fall through to /onboard skill injection.
+        """
+        threshold = self.onboard_config.get('pickupThresholdMinutes', 10)
+
+        handoff = self._parse_last_handoff()
+        if not handoff:
+            log("Python pickup: no handoff found")
+            return False
+        if handoff["age_minutes"] > 2880:  # 48 hours
+            log(f"Python pickup: handoff too old ({handoff['age_minutes']:.0f}m)")
+            return False
+
+        # Session health check
+        health = self._check_session_health(handoff["timestamp"])
+        if health["status"] == "thrashing":
+            warn = (f"[v{VERSION}] THRASHING: {health['count']} brief sessions in 30min "
+                    f"— falling back to /onboard")
+            sys.stdout.write(f"\r\n\033[93m{warn}\033[0m\r\n")
+            sys.stdout.flush()
+            log(warn)
+            if self.session_logger:
+                self.session_logger.write_event("THRASHING", warn)
+            return False
+        if health["status"] == "crash":
+            sid = health["session"].get("sid", "unknown")
+            warn = f"[v{VERSION}] CRASH: last session ({sid}) ended without handoff"
+            sys.stdout.write(f"\r\n\033[93m{warn}\033[0m\r\n")
+            sys.stdout.flush()
+            log(warn)
+            if self.session_logger:
+                self.session_logger.write_event("CRASH", warn)
+            return False
+
+        # Compose and write context file
+        result = self._compose_pickup_context(handoff)
+        if not result:
+            log("Python pickup: context composition failed")
+            return False
+        context_path, files_loaded = result
+
+        # Echo pickup report to TUI + mirror
+        age_str = f"{handoff['age_minutes']:.0f}m"
+        report = f"[v{VERSION}] Pickup: {age_str} ago | {files_loaded} files preloaded"
+        sys.stdout.write(f"\r\n\033[90m{report}\033[0m\r\n")
+        sys.stdout.flush()
+        log(report)
+        if self.session_logger:
+            self.session_logger.write_event("PICKUP", report)
+
+        # Inject short message into PTY — Claude reads the single context file
+        # Use path relative to cwd so Claude's Read tool resolves it
+        rel_path = os.path.relpath(context_path, self.cwd).replace('\\', '/')
+        inject_msg = (f"Read {rel_path} — this is preloaded session context from the "
+                      f"previous handoff ({age_str} ago, {files_loaded} files). "
+                      f"Internalize it, then report ready and ask what to work on next.")
+        pty.write(inject_msg + '\r')
+        log(f"Python pickup: injected context message ({len(inject_msg)} chars)")
+        return True
+
+    # ── End Python-side pickup ───────────────────────────────────────
 
     def _purge_old_logs(self, max_age_days: int = 7):
         """Delete session logs older than max_age_days from logs/ directory."""
@@ -1101,13 +1392,30 @@ class Unleashed:
                 if not self._init_cmd_sent:
                     if b'\xe2\x9d\xaf' in clean_chunk:  # ❯ (UTF-8)
                         self._init_cmd_sent = True
+                        # v31: inject config echo into TUI stream + mirror
+                        if self._config_echo:
+                            echo_line = f"\033[90m{self._config_echo}\033[0m"
+                            sys.stdout.write(f"\r\n{echo_line}\r\n")
+                            sys.stdout.flush()
+                            if self.session_logger:
+                                self.session_logger.write_event("CONFIG", self._config_echo)
+                            self._config_echo = None
                         time.sleep(0.5)
-                        if self.pickup:
-                            pty.write('/onboard --pickup\r')
-                            log("Auto-sent /onboard --pickup (explicit --pickup flag)")
-                        elif self.auto_onboard:
-                            pty.write('/onboard\r')
-                            log("Auto-sent /onboard")
+                        # v31 #136: Try Python-side pickup first — saves ~1000 Opus tokens
+                        pickup_handled = False
+                        if self.pickup or self.auto_onboard:
+                            try:
+                                pickup_handled = self._attempt_python_pickup(pty)
+                            except Exception as e:
+                                log(f"WARNING: Python pickup failed, falling back: {e}")
+                        # Fallback: skill-based onboard
+                        if not pickup_handled:
+                            if self.pickup:
+                                pty.write('/onboard --pickup\r')
+                                log("Auto-sent /onboard --pickup (fallback)")
+                            elif self.auto_onboard:
+                                pty.write('/onboard\r')
+                                log("Auto-sent /onboard")
 
                 # v29: Compaction emergency trigger — match status bar at 0%, not conversation text (#123)
                 if self.handoff_compaction_trigger and not self._handoff_sent:
