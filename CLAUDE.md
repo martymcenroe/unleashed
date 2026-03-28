@@ -5,6 +5,7 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 ## Key Files
 
 - `src/unleashed-c-30.py` — Claude production (c-29 + auto-onboard, session index, --sessions, config echo)
+- `src/unleashed-c-31.py` — Claude alpha (c-30 + idle CPU reduction: event-driven main loop, WaitForSingleObject stdin, slower resize poll)
 - `src/unleashed-c-29.py` — Claude historical (c-28 + compaction regex fix, timer via tab title)
 - `src/unleashed-c-28.py` — Claude historical (auto-handoff: compaction trigger + timer reminder)
 - `src/unleashed-g-20.py` — Gemini production (g-19 + console tab, per-repo logs, focus-back, auto-tab-naming)
@@ -24,7 +25,7 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 
 ```bash
 unleashed              # Claude production (c-30)
-unleashed-alpha        # (no alpha configured)
+unleashed-alpha        # Claude alpha (c-31)
 unleashed-g            # Gemini production (g-20)
 unleashed-t            # Codex production (t-03)
 sentinel               # Standalone security check
