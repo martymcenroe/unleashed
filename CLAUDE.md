@@ -11,7 +11,8 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 - `src/unleashed-g-21.py` — Gemini production (g-20 + event-driven loop, config, session index, pickup)
 - `src/unleashed-g-20.py` — Gemini historical (g-19 + console tab, per-repo logs, focus-back, auto-tab-naming)
 - `src/unleashed-g-19.py` — Gemini historical (triplet + 3 permission patterns)
-- `src/unleashed-t-04.py` — Codex production (t-03 + event-driven loop, session index, resize 2s)
+- `src/unleashed-t-05.py` — Codex production (t-04 + heartbeat, focus-back, resume/fork)
+- `src/unleashed-t-04.py` — Codex historical (t-03 + event-driven loop, session index, resize 2s)
 - `src/unleashed-t-03.py` — Codex historical (t-02 + proxy fix, schannel→openssl, --search)
 - `src/unleashed-t-01.py` — Codex historical (PTY wrapper, session logging)
 - `src/unleashed-t-02.py` — Codex historical (t-01 + console tab, per-repo logs, focus-back)
@@ -28,7 +29,7 @@ Permission bypass system for Claude Code - enables autonomous coding sessions.
 ```bash
 unleashed              # Claude production (c-31)
 unleashed-g            # Gemini production (g-21)
-unleashed-t            # Codex production (t-04)
+unleashed-t            # Codex production (t-05)
 sentinel               # Standalone security check
 ```
 
